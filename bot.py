@@ -14,6 +14,7 @@ import asyncio
 import time
 import sqlite3
 import traceback
+import threading
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -878,8 +879,7 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 application.add_error_handler(error_handler)
 
-# -------------------- 🔥 FIX: Persistent event loop --------------------
-# Create a single event loop for the whole application
+# -------------------- 🔥 FIX: Persistent event loop in background thread --------------------
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
@@ -890,8 +890,15 @@ if BOT_TOKEN:
         logger.info("✅ Bot application initialized and started.")
     except Exception as e:
         logger.error(f"❌ Failed to initialize application: {e}")
-else:
-    logger.warning("No token, bot not started.")
+
+def run_loop():
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+# Start the loop in a daemon thread
+thread = threading.Thread(target=run_loop, daemon=True)
+thread.start()
+logger.info("✅ Event loop running in background thread.")
 
 # ----------------------------------------------
 # Webhook endpoint
@@ -903,13 +910,15 @@ def webhook():
             abort(400)
         try:
             update = Update.de_json(json_data, application.bot)
-            # Use the persistent loop to process the update
+            # Submit the coroutine to the running loop
             future = asyncio.run_coroutine_threadsafe(
                 application.process_update(update),
                 loop
             )
-            # Wait for the result with a timeout to avoid hanging
-            future.result(timeout=10)
+            # Wait for completion (adjust timeout as needed)
+            future.result(timeout=30)  # increased from 10 to 30 seconds
+        except TimeoutError:
+            logger.error("Webhook processing timed out after 30 seconds.")
         except Exception as e:
             logger.error(f"Error processing update: {e}\n{traceback.format_exc()}")
         return 'OK', 200
