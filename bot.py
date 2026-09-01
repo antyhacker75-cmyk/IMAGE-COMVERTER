@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot + Dashboard
-Modern UI, console, real-time clock, user stats, admin panel + Leak + Targets.
+Modern UI, console, real-time clock, user stats, admin panel + Leak + Targets + Join Group.
 With file size checks (>50 MB) and robust error handling.
 """
 import os
@@ -980,7 +980,7 @@ def commands():
         return "Internal Server Error", 500
 
 # ----------------------------------------------
-# Telegram Bot – All features + Targets + Button workflow + Size checks
+# Telegram Bot – All features + Targets + Button workflow + Size checks + Join Group
 # ----------------------------------------------
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -1003,7 +1003,8 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup([
     ["📋 Stats", "🚫 Ban User"],
     ["✅ Unban User", "📢 Announcement"],
     ["✉️ Reply to User", "📤 Leak Requests"],
-    ["🎯 Targets", "⬅️ Back"]
+    ["🎯 Targets", "➕ Join Group"],
+    ["⬅️ Back"]
 ], resize_keyboard=True, is_persistent=True)
 
 TARGETS_KEYBOARD = ReplyKeyboardMarkup([
@@ -1226,7 +1227,7 @@ async def do_conversion(update, message, file_obj, file_name, file_ext, is_first
             header_content = await asyncio.to_thread(generate_header_from_data, data, file_name)
             increment_count(user.id)
             file_size = len(data)
-            # The header file size will be roughly 3x the original (since each byte becomes "0xXX, "). Check that.
+            # Check header size
             header_size = len(header_content)
             if header_size > MAX_FILE_SIZE:
                 await progress_msg.edit_text(f"❌ Generated header is too large ({header_size/1024/1024:.1f} MB > 50 MB). Cannot send via Telegram.", parse_mode="HTML")
@@ -1756,6 +1757,33 @@ async def handle_leak_custom_id(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="HTML"
     )
 
+# ---- Join Group handler ----
+async def handle_join_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('join_group'):
+        return
+    text = update.message.text.strip()
+    if text.lower() == 'cancel':
+        context.user_data.pop('join_group', None)
+        await update.message.reply_text("❌ Join group cancelled.", parse_mode="HTML")
+        return
+    try:
+        chat = await update.get_bot().join_chat(text)
+        await update.message.reply_text(
+            f"✅ Successfully joined <b>{chat.title}</b> (ID: <code>{chat.id}</code>).",
+            parse_mode="HTML"
+        )
+    except TelegramError as e:
+        error_msg = str(e)
+        if "already a member" in error_msg.lower():
+            await update.message.reply_text("ℹ️ The bot is already a member of this chat.", parse_mode="HTML")
+        elif "not found" in error_msg.lower() or "invalid" in error_msg.lower():
+            await update.message.reply_text("❌ Could not find the chat. Make sure the ID or invite link is correct.", parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"❌ Failed to join: {error_msg}", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}", parse_mode="HTML")
+    context.user_data.pop('join_group', None)
+
 # ---- Main handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1822,7 +1850,19 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_targets_menu(update, context)
         else:
             await update.message.reply_text("❌ You are not an admin.", reply_markup=main_keyboard, parse_mode="HTML")
+    elif text == "➕ Join Group":
+        if admin:
+            context.user_data['join_group'] = True
+            await update.message.reply_text(
+                "📝 Send the group ID (e.g., <code>-1001234567890</code>) or an invite link.\n"
+                "The bot will try to join that group/channel.\n"
+                "Type <code>cancel</code> to abort.",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text("❌ You are not an admin.", reply_markup=main_keyboard, parse_mode="HTML")
     else:
+        # Existing admin buttons
         if text == "📊 Set Limit":
             await update.message.reply_text("📝 Send: <code>/setlimit &lt;user_id&gt; &lt;limit&gt;</code>\n(use -1 for unlimited)", parse_mode="HTML")
         elif text == "🔄 Reset Limit":
@@ -2035,15 +2075,15 @@ BOT_TOKEN = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     print("⚠️ No bot token set. Set it in the dashboard or via env.")
 
-# Use longer timeouts for large file downloads
 request_obj = HTTPXRequest(
     connect_timeout=30.0,
-    read_timeout=120.0,   # increased for large files
+    read_timeout=120.0,
     write_timeout=30.0,
     connection_pool_size=8
 )
 application = Application.builder().token(BOT_TOKEN).request(request_obj).concurrent_updates(True).build()
 
+# Command handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("help", help_command))
 application.add_handler(CommandHandler("setlimit", admin_set_limit))
@@ -2055,11 +2095,23 @@ application.add_handler(CommandHandler("ban", admin_ban))
 application.add_handler(CommandHandler("unban", admin_unban))
 application.add_handler(CommandHandler("announce", admin_announce))
 application.add_handler(CommandHandler("reply", admin_reply_text))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+
+# Message handlers with priorities
+# Group 1: join group state
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_join_group), group=1)
+# Group 2: menu handler
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu), group=2)
+
+# File handlers
 application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 application.add_handler(MessageHandler(filters.ALL, handle_forwarded_reply))
+
+# Callback query handlers
 application.add_handler(CallbackQueryHandler(leak_callback, pattern="^leak_"))
+# Custom ID handler for leaks
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^-?\\d+$'), handle_leak_custom_id))
+
+# Error handler
 application.add_error_handler(error_handler)
 
 # ----------------------------------------------
