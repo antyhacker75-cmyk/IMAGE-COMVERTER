@@ -858,7 +858,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 BOT_TOKEN = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     print("⚠️ No bot token set. Set it in the dashboard or via env.")
-    # We'll still run but webhook will fail
 
 request_obj = HTTPXRequest(
     connect_timeout=30.0,
@@ -879,15 +878,20 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 application.add_error_handler(error_handler)
 
-# -------------------- 🔥 FIX: Initialize the application --------------------
+# -------------------- 🔥 FIX: Persistent event loop --------------------
+# Create a single event loop for the whole application
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 if BOT_TOKEN:
     try:
-        # Initialize the application so we can process updates in the webhook
-        asyncio.run(application.initialize())
-        asyncio.run(application.start())
-        logger.info("✅ Bot application initialized successfully.")
+        loop.run_until_complete(application.initialize())
+        loop.run_until_complete(application.start())
+        logger.info("✅ Bot application initialized and started.")
     except Exception as e:
         logger.error(f"❌ Failed to initialize application: {e}")
+else:
+    logger.warning("No token, bot not started.")
 
 # ----------------------------------------------
 # Webhook endpoint
@@ -899,8 +903,13 @@ def webhook():
             abort(400)
         try:
             update = Update.de_json(json_data, application.bot)
-            # We can safely call process_update because the application is initialized
-            asyncio.run(application.process_update(update))
+            # Use the persistent loop to process the update
+            future = asyncio.run_coroutine_threadsafe(
+                application.process_update(update),
+                loop
+            )
+            # Wait for the result with a timeout to avoid hanging
+            future.result(timeout=10)
         except Exception as e:
             logger.error(f"Error processing update: {e}\n{traceback.format_exc()}")
         return 'OK', 200
