@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.request import HTTPXRequest   # <-- new import for custom request
+from telegram.request import HTTPXRequest
 
 # ----------------------------------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -507,7 +507,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_menu_keyboard()
         )
 
-# -------------------- MAIN (webhook) with retry & timeout --------------------
+# -------------------- MAIN (webhook) --------------------
 def main():
     # Use a custom request with longer timeouts
     request = HTTPXRequest(
@@ -517,14 +517,12 @@ def main():
         connection_pool_size=8
     )
 
-    # Build the application
     app = Application.builder() \
         .token(TOKEN) \
         .request(request) \
         .concurrent_updates(True) \
         .build()
 
-    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setlimit", admin_set_limit))
@@ -535,7 +533,6 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_error_handler(error_handler)
 
-    # Webhook setup
     port = int(os.environ.get("PORT", 10000))
     webhook_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not webhook_url:
@@ -545,26 +542,13 @@ def main():
 
     print(f"🤖 Starting webhook at: {webhook_url}")
 
-    # Retry loop if initialization fails due to timeout
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path=TOKEN,
-                webhook_url=webhook_url
-            )
-            break  # success
-        except Exception as e:
-            logger.error(f"Webhook startup attempt {attempt} failed: {e}")
-            if attempt < max_retries:
-                wait = attempt * 5
-                print(f"Retrying in {wait} seconds...")
-                time.sleep(wait)
-            else:
-                print("All retries failed. Exiting.")
-                sys.exit(1)
+    # run_webhook handles retries internally – no need for our own loop
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=webhook_url
+    )
 
 if __name__ == "__main__":
     main()
