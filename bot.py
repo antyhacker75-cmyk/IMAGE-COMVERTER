@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot: Image ↔ C Header Converter
-With sequential queue, admin notifications (with file), and per‑user limits.
+With webhooks – runs on Render Web Service (free) without needing keep‑alive.
 Admin Chat ID: 5682792112
 Time zone: Asia/Manila (UTC+8)
 """
@@ -17,11 +17,10 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ----------------------------------------------
-# Read token from environment (SECURE)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     print("❌ No TELEGRAM_BOT_TOKEN set! Please set the environment variable.")
@@ -507,7 +506,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_menu_keyboard()
         )
 
-# -------------------- MAIN --------------------
+# -------------------- MAIN (webhook) --------------------
 def main():
     app = Application.builder().token(TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
@@ -521,8 +520,22 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_error_handler(error_handler)
-    print("🤖 Bot running with queue, admin notifications (with files), and limits. Press Ctrl+C to stop.")
-    app.run_polling()
+
+    # Webhook setup – Render provides the public URL via RENDER_EXTERNAL_URL
+    port = int(os.environ.get("PORT", 10000))
+    webhook_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not webhook_url:
+        print("❌ RENDER_EXTERNAL_URL not set – are you running on Render?")
+        sys.exit(1)
+    webhook_url = webhook_url.rstrip('/') + '/' + TOKEN   # unique path
+
+    print(f"🤖 Starting webhook at: {webhook_url}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=webhook_url
+    )
 
 if __name__ == "__main__":
     main()
