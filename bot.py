@@ -13,6 +13,7 @@ import re
 import asyncio
 import time
 import sqlite3
+import traceback
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -24,7 +25,11 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.request import HTTPXRequest
 
 # ----------------------------------------------
-# Database setup
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Database
 DB_PATH = "bot_settings.db"
 
 def init_db():
@@ -83,7 +88,6 @@ init_db()
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# Login decorator
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -92,8 +96,53 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# HTML templates (embedded)
-DASHBOARD_HTML = """
+# ---- Login page ----
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Login</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+<style>
+    body { display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5; font-family: sans-serif; }
+    .login-box { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 340px; }
+    .login-box h2 { margin-bottom: 20px; text-align: center; }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; margin-bottom: 4px; }
+    .form-group input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; }
+    .btn { width: 100%; padding: 10px; background: #1abc9c; color: white; border: none; border-radius: 6px; cursor: pointer; }
+    .flash { padding: 10px; margin-bottom: 16px; border-radius: 6px; }
+    .flash.danger { background: #e74c3c; color: white; }
+    .flash.success { background: #2ecc71; color: white; }
+</style>
+</head>
+<body>
+<div class="login-box">
+    <h2><i class="fas fa-lock"></i> Admin Login</h2>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+    <form method="post">
+        <div class="form-group">
+            <label>Username</label>
+            <input type="text" name="username" required>
+        </div>
+        <div class="form-group">
+            <label>Password</label>
+            <input type="password" name="password" required>
+        </div>
+        <button type="submit" class="btn"><i class="fas fa-sign-in-alt"></i> Login</button>
+    </form>
+</div>
+</body>
+</html>
+"""
+
+# ---- Base layout (sidebar) ----
+BASE_LAYOUT = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -137,9 +186,9 @@ DASHBOARD_HTML = """
 <body>
     <div class="sidebar">
         <h2><i class="fas fa-robot"></i> Bot Control</h2>
-        <a href="{{ url_for('dashboard') }}" class="active"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
-        <a href="{{ url_for('settings') }}"><i class="fas fa-cog"></i> Settings</a>
-        <a href="{{ url_for('commands') }}"><i class="fas fa-list-ul"></i> Commands</a>
+        <a href="{{ url_for('dashboard') }}" class="{% if active == 'dashboard' %}active{% endif %}"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
+        <a href="{{ url_for('settings') }}" class="{% if active == 'settings' %}active{% endif %}"><i class="fas fa-cog"></i> Settings</a>
+        <a href="{{ url_for('commands') }}" class="{% if active == 'commands' %}active{% endif %}"><i class="fas fa-list-ul"></i> Commands</a>
         <a href="{{ url_for('logout') }}" style="margin-top: auto;"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
     <div class="content">
@@ -156,8 +205,7 @@ DASHBOARD_HTML = """
 </html>
 """
 
-# ----------------------------------------------
-# Flask Routes
+# ---- Routes ----
 @app.route('/')
 def index():
     return redirect(url_for('dashboard'))
@@ -177,48 +225,7 @@ def login():
             return redirect(url_for('dashboard'))
         else:
             flash('Invalid credentials', 'danger')
-    return render_template_string('''
-        <!DOCTYPE html>
-        <html>
-        <head><title>Login</title>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
-        <style>
-            body { display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5; font-family: sans-serif; }
-            .login-box { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 340px; }
-            .login-box h2 { margin-bottom: 20px; text-align: center; }
-            .form-group { margin-bottom: 16px; }
-            .form-group label { display: block; margin-bottom: 4px; }
-            .form-group input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; }
-            .btn { width: 100%; padding: 10px; background: #1abc9c; color: white; border: none; border-radius: 6px; cursor: pointer; }
-            .flash { padding: 10px; margin-bottom: 16px; border-radius: 6px; }
-            .flash.danger { background: #e74c3c; color: white; }
-        </style>
-        </head>
-        <body>
-            <div class="login-box">
-                <h2><i class="fas fa-lock"></i> Admin Login</h2>
-                {% with messages = get_flashed_messages(with_categories=true) %}
-                  {% if messages %}
-                    {% for category, message in messages %}
-                      <div class="flash {{ category }}">{{ message }}</div>
-                    {% endfor %}
-                  {% endif %}
-                {% endwith %}
-                <form method="post">
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" name="username" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" name="password" required>
-                    </div>
-                    <button type="submit" class="btn"><i class="fas fa-sign-in-alt"></i> Login</button>
-                </form>
-            </div>
-        </body>
-        </html>
-    ''')
+    return render_template_string(LOGIN_HTML)
 
 @app.route('/logout')
 def logout():
@@ -229,33 +236,35 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    bot_name = get_setting('bot_name') or 'Image↔C Header Converter'
-    bot_token = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN', 'Not set')
-    logo_url = get_setting('logo_url') or 'https://cdn-icons-png.flaticon.com/512/60/60580.png'
-    # Show only first 8 chars of token for security
-    token_display = bot_token[:8] + '...' if bot_token and len(bot_token) > 8 else 'Not set'
-    commands = [
-        {'cmd': '/start', 'desc': 'Show welcome menu'},
-        {'cmd': '/help', 'desc': 'Show help'},
-        {'cmd': 'Send Image as Document', 'desc': 'Convert image to C header (.h)'},
-        {'cmd': 'Send .h file', 'desc': 'Recover original image from header'},
-        {'cmd': 'Home / Convert / Commands / Usage / Profile', 'desc': 'Keyboard navigation buttons'},
-    ]
-    if session.get('username') == 'r3nz75':
-        commands.extend([
-            {'cmd': '/setlimit', 'desc': 'Admin: Set user daily limit'},
-            {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count'},
-            {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user'},
-            {'cmd': '/stats', 'desc': 'Admin: View user stats'},
-        ])
-    return render_template_string(DASHBOARD_HTML + """
-        {% block content %}
+    try:
+        bot_name = get_setting('bot_name') or 'Image↔C Header Converter'
+        bot_token = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN', 'Not set')
+        logo_url = get_setting('logo_url') or 'https://cdn-icons-png.flaticon.com/512/60/60580.png'
+        token_display = bot_token[:8] + '...' if bot_token and len(bot_token) > 8 else 'Not set'
+
+        commands = [
+            {'cmd': '/start', 'desc': 'Show welcome menu'},
+            {'cmd': '/help', 'desc': 'Show help'},
+            {'cmd': 'Send Image as Document', 'desc': 'Convert image to C header (.h)'},
+            {'cmd': 'Send .h file', 'desc': 'Recover original image from header'},
+            {'cmd': 'Home / Convert / Commands / Usage / Profile', 'desc': 'Keyboard navigation buttons'},
+        ]
+        if session.get('username') == 'r3nz75':
+            commands.extend([
+                {'cmd': '/setlimit', 'desc': 'Admin: Set user daily limit'},
+                {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count'},
+                {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user'},
+                {'cmd': '/stats', 'desc': 'Admin: View user stats'},
+            ])
+
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+        content = f"""
         <div class="card">
             <h3><i class="fas fa-chart-simple"></i> Overview</h3>
             <div class="stat-grid">
                 <div class="stat-item">
                     <i class="fas fa-command"></i>
-                    <div class="number">{{ commands|length }}</div>
+                    <div class="number">{len(commands)}</div>
                     <div class="label">Total Commands</div>
                 </div>
                 <div class="stat-item">
@@ -265,60 +274,63 @@ def dashboard():
                 </div>
                 <div class="stat-item">
                     <i class="fas fa-clock"></i>
-                    <div class="number">{{ now }}</div>
+                    <div class="number">{now_str}</div>
                     <div class="label">Server Time</div>
                 </div>
             </div>
         </div>
         <div class="card">
             <h3><i class="fas fa-info-circle"></i> Bot Info</h3>
-            <p><strong>Bot Name:</strong> {{ bot_name }}</p>
-            <p><strong>Token:</strong> {{ token_display }}</p>
-            <p><strong>Logo:</strong> <img src="{{ logo_url }}" class="logo-preview" alt="Logo"></p>
+            <p><strong>Bot Name:</strong> {bot_name}</p>
+            <p><strong>Token:</strong> {token_display}</p>
+            <p><strong>Logo:</strong> <img src="{logo_url}" class="logo-preview" alt="Logo"></p>
         </div>
-        {% endblock %}
-    """, commands=commands, now=datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M'),
-    bot_name=bot_name, token_display=token_display, logo_url=logo_url)
+        """
+        return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', '{% block content %}' + content + '{% endblock %}'), active='dashboard')
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}\n{traceback.format_exc()}")
+        return "Internal Server Error", 500
 
 @app.route('/settings', methods=['GET', 'POST'])
 @login_required
 def settings():
-    if request.method == 'POST':
-        new_token = request.form.get('bot_token', '').strip()
-        new_name = request.form.get('bot_name', '').strip()
-        new_logo = request.form.get('logo_url', '').strip()
-        new_password = request.form.get('admin_password', '').strip()
-        if new_token:
-            set_setting('bot_token', new_token)
-        if new_name:
-            set_setting('bot_name', new_name)
-        if new_logo:
-            set_setting('logo_url', new_logo)
-        if new_password:
-            update_admin(session['username'], new_password)
-        flash('Settings updated! (Token changes require a restart to take effect)', 'success')
-        return redirect(url_for('settings'))
+    try:
+        if request.method == 'POST':
+            new_token = request.form.get('bot_token', '').strip()
+            new_name = request.form.get('bot_name', '').strip()
+            new_logo = request.form.get('logo_url', '').strip()
+            new_password = request.form.get('admin_password', '').strip()
+            if new_token:
+                set_setting('bot_token', new_token)
+            if new_name:
+                set_setting('bot_name', new_name)
+            if new_logo:
+                set_setting('logo_url', new_logo)
+            if new_password:
+                update_admin(session['username'], new_password)
+            flash('Settings updated! (Token changes require a restart to take effect)', 'success')
+            return redirect(url_for('settings'))
 
-    bot_token = get_setting('bot_token') or ''
-    bot_name = get_setting('bot_name') or 'Image↔C Header Converter'
-    logo_url = get_setting('logo_url') or 'https://cdn-icons-png.flaticon.com/512/60/60580.png'
-    return render_template_string(DASHBOARD_HTML + """
-        {% block content %}
+        bot_token = get_setting('bot_token') or ''
+        bot_name = get_setting('bot_name') or 'Image↔C Header Converter'
+        logo_url = get_setting('logo_url') or 'https://cdn-icons-png.flaticon.com/512/60/60580.png'
+
+        content = f"""
         <div class="card">
             <h3><i class="fas fa-cog"></i> Bot Settings</h3>
             <form method="post">
                 <div class="form-group">
                     <label>Bot Token (changes require restart)</label>
-                    <input type="text" name="bot_token" value="{{ bot_token }}" placeholder="Enter new token">
+                    <input type="text" name="bot_token" value="{bot_token}" placeholder="Enter new token">
                 </div>
                 <div class="form-group">
                     <label>Bot Name</label>
-                    <input type="text" name="bot_name" value="{{ bot_name }}" placeholder="Bot display name">
+                    <input type="text" name="bot_name" value="{bot_name}" placeholder="Bot display name">
                 </div>
                 <div class="form-group">
                     <label>Logo URL</label>
-                    <input type="text" name="logo_url" value="{{ logo_url }}" placeholder="https://example.com/logo.png">
-                    <img src="{{ logo_url }}" class="logo-preview" style="margin-top:8px;" alt="Logo preview">
+                    <input type="text" name="logo_url" value="{logo_url}" placeholder="https://example.com/logo.png">
+                    <img src="{logo_url}" class="logo-preview" style="margin-top:8px;" alt="Logo preview">
                 </div>
                 <div class="form-group">
                     <label>Change Admin Password (leave blank to keep current)</label>
@@ -327,49 +339,50 @@ def settings():
                 <button type="submit" class="btn"><i class="fas fa-save"></i> Save Changes</button>
             </form>
         </div>
-        {% endblock %}
-    """, bot_token=bot_token, bot_name=bot_name, logo_url=logo_url)
+        """
+        return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', '{% block content %}' + content + '{% endblock %}'), active='settings')
+    except Exception as e:
+        logger.error(f"Settings error: {e}\n{traceback.format_exc()}")
+        return "Internal Server Error", 500
 
 @app.route('/commands')
 @login_required
 def commands():
-    cmd_list = [
-        {'cmd': '/start', 'desc': 'Show welcome menu and keyboard.'},
-        {'cmd': '/help', 'desc': 'Display help text.'},
-        {'cmd': 'Send Image as Document', 'desc': 'Convert image to C header (.h).'},
-        {'cmd': 'Send .h file', 'desc': 'Recover original image from header.'},
-        {'cmd': 'Home / Convert / Commands / Usage / Profile', 'desc': 'Keyboard buttons for quick navigation.'},
-    ]
-    if session.get('username') == 'r3nz75':
-        cmd_list.extend([
-            {'cmd': '/setlimit', 'desc': 'Admin: Set user daily limit.'},
-            {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count.'},
-            {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user.'},
-            {'cmd': '/stats', 'desc': 'Admin: View user stats.'},
-        ])
-    return render_template_string(DASHBOARD_HTML + """
-        {% block content %}
+    try:
+        cmd_list = [
+            {'cmd': '/start', 'desc': 'Show welcome menu and keyboard.'},
+            {'cmd': '/help', 'desc': 'Display help text.'},
+            {'cmd': 'Send Image as Document', 'desc': 'Convert image to C header (.h).'},
+            {'cmd': 'Send .h file', 'desc': 'Recover original image from header.'},
+            {'cmd': 'Home / Convert / Commands / Usage / Profile', 'desc': 'Keyboard buttons for quick navigation.'},
+        ]
+        if session.get('username') == 'r3nz75':
+            cmd_list.extend([
+                {'cmd': '/setlimit', 'desc': 'Admin: Set user daily limit.'},
+                {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count.'},
+                {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user.'},
+                {'cmd': '/stats', 'desc': 'Admin: View user stats.'},
+            ])
+
+        items = ''.join([f'<li><span class="cmd">{c["cmd"]}</span><span class="desc">{c["desc"]}</span></li>' for c in cmd_list])
+        content = f"""
         <div class="card">
             <h3><i class="fas fa-list-ul"></i> Available Commands</h3>
             <ul class="commands-list">
-                {% for c in commands %}
-                <li>
-                    <span class="cmd">{{ c.cmd }}</span>
-                    <span class="desc">{{ c.desc }}</span>
-                </li>
-                {% endfor %}
+                {items}
             </ul>
         </div>
-        {% endblock %}
-    """, commands=cmd_list)
+        """
+        return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', '{% block content %}' + content + '{% endblock %}'), active='commands')
+    except Exception as e:
+        logger.error(f"Commands error: {e}\n{traceback.format_exc()}")
+        return "Internal Server Error", 500
 
 # ----------------------------------------------
-# Telegram Bot Handlers (copied from your working bot)
+# Telegram Bot Handlers (copied from your working code)
 # (All your original functions – start, help, handle_menu, handle_file,
 # admin commands, queue, progress, conversion, etc.)
-# I'll include them below exactly as you had them – but with one small fix:
-# In generate_header_from_data, I removed the f-string that had a newline issue.
-# I'll paste the exact handlers from your "perfect working fine" code.
+# I'll include them below exactly as you had them – with the small fix for the newline.
 
 # -------------------- KEYBOARD --------------------
 def get_menu_keyboard():
@@ -879,7 +892,7 @@ def webhook():
             update = Update.de_json(json_data, application.bot)
             asyncio.run(application.process_update(update))
         except Exception as e:
-            logging.error(f"Error processing update: {e}")
+            logger.error(f"Error processing update: {e}\n{traceback.format_exc()}")
         return 'OK', 200
     return 'Method not allowed', 405
 
