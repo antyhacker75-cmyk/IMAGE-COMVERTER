@@ -380,9 +380,8 @@ def commands():
 
 # ----------------------------------------------
 # Telegram Bot Handlers (copied from your working code)
-# (All your original functions – start, help, handle_menu, handle_file,
-# admin commands, queue, progress, conversion, etc.)
-# I'll include them below exactly as you had them – with the small fix for the newline.
+# All your original functions – start, help, handle_menu, handle_file,
+# admin commands, queue, progress, conversion, etc.
 
 # -------------------- KEYBOARD --------------------
 def get_menu_keyboard():
@@ -880,6 +879,16 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 application.add_error_handler(error_handler)
 
+# -------------------- 🔥 FIX: Initialize the application --------------------
+if BOT_TOKEN:
+    try:
+        # Initialize the application so we can process updates in the webhook
+        asyncio.run(application.initialize())
+        asyncio.run(application.start())
+        logger.info("✅ Bot application initialized successfully.")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize application: {e}")
+
 # ----------------------------------------------
 # Webhook endpoint
 @app.route('/webhook', methods=['POST'])
@@ -890,6 +899,7 @@ def webhook():
             abort(400)
         try:
             update = Update.de_json(json_data, application.bot)
+            # We can safely call process_update because the application is initialized
             asyncio.run(application.process_update(update))
         except Exception as e:
             logger.error(f"Error processing update: {e}\n{traceback.format_exc()}")
