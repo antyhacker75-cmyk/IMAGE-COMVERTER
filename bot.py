@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram Bot + Dashboard
-Full button-driven UI, admin management, and bot name/photo update.
-Now with /setlimitall to set a daily limit for all users at once.
+Full button-driven UI, admin management, bot name/photo update,
+reply system, bans, announcements, and user stats with usernames.
 """
 import os
 import sys
@@ -48,6 +48,11 @@ def init_db():
         password TEXT NOT NULL,
         telegram_id TEXT,
         is_super BOOLEAN DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS banned_users (
+        user_id INTEGER PRIMARY KEY,
+        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        reason TEXT
     )''')
     c.execute("INSERT OR IGNORE INTO admins (username, password, telegram_id, is_super) VALUES (?, ?, ?, ?)",
               ("r3nz75", "r3nz75converter2027", str(5682792112), 1))
@@ -149,8 +154,51 @@ def get_primary_admin_chat_id():
 
 ADMIN_CHAT_ID = get_primary_admin_chat_id()
 
-# ----------------------------------------------
-# Flask app
+# ---------- Ban functions ----------
+def ban_user(user_id, reason=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO banned_users (user_id, reason) VALUES (?, ?)", (user_id, reason))
+    conn.commit()
+    conn.close()
+
+def unban_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def is_user_banned(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM banned_users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+def get_ban_reason(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT reason FROM banned_users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# ---------- User info storage ----------
+# We'll extend user_stats to store username and full_name
+user_stats = {}  # {user_id: {"count": int, "limit": int, "date": str, "username": str, "full_name": str}}
+
+def update_user_info(user_id, username=None, full_name=None):
+    if user_id not in user_stats:
+        user_stats[user_id] = {"count": 0, "limit": 5, "date": get_today(), "username": username, "full_name": full_name}
+    else:
+        if username:
+            user_stats[user_id]["username"] = username
+        if full_name:
+            user_stats[user_id]["full_name"] = full_name
+
+# ---------- Flask app ----------
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
@@ -328,6 +376,10 @@ def dashboard():
             {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count'},
             {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user'},
             {'cmd': '/setlimitall', 'desc': 'Admin: Set daily limit for ALL users'},
+            {'cmd': '/ban', 'desc': 'Admin: Ban a user'},
+            {'cmd': '/unban', 'desc': 'Admin: Unban a user'},
+            {'cmd': '/reply', 'desc': 'Admin: Reply to a user'},
+            {'cmd': '/announce', 'desc': 'Admin: Send announcement to all users'},
             {'cmd': '/stats', 'desc': 'Admin: View user stats'},
         ])
 
@@ -393,7 +445,6 @@ def settings():
                 global ADMIN_CHAT_ID
                 ADMIN_CHAT_ID = int(new_admin_tid)
 
-            # Handle bot photo upload
             if new_photo_file and new_photo_file.filename:
                 tmp_path = f"/tmp/bot_photo_{int(time.time())}.jpg"
                 new_photo_file.save(tmp_path)
@@ -413,7 +464,6 @@ def settings():
                         flash(f'Error updating photo: {e}', 'danger')
                 os.remove(tmp_path)
 
-            # Update bot name via API
             token = new_token or get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
             if token and new_name:
                 try:
@@ -573,6 +623,10 @@ def commands():
             {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count.'},
             {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user.'},
             {'cmd': '/setlimitall', 'desc': 'Admin: Set daily limit for ALL users.'},
+            {'cmd': '/ban', 'desc': 'Admin: Ban a user.'},
+            {'cmd': '/unban', 'desc': 'Admin: Unban a user.'},
+            {'cmd': '/reply', 'desc': 'Admin: Reply to a user.'},
+            {'cmd': '/announce', 'desc': 'Admin: Send announcement to all users.'},
             {'cmd': '/stats', 'desc': 'Admin: View user stats.'},
         ])
         items = ''.join([f'<li><span class="cmd">{c["cmd"]}</span><span class="desc">{c["desc"]}</span></li>' for c in cmd_list])
@@ -590,8 +644,13 @@ def commands():
         return "Internal Server Error", 500
 
 # ----------------------------------------------
-# Telegram Bot Handlers (with button-driven admin menu)
+# Telegram Bot Handlers
 # ----------------------------------------------
+
+MANILA_TZ = timezone(timedelta(hours=8))
+
+def get_today():
+    return datetime.now(MANILA_TZ).strftime("%Y-%m-%d")
 
 # Custom keyboards
 def get_main_keyboard(has_admin=False):
@@ -609,9 +668,12 @@ def get_main_keyboard(has_admin=False):
 ADMIN_KEYBOARD = ReplyKeyboardMarkup([
     ["Set Limit", "Reset Limit"],
     ["Set Premium", "Stats"],
-    ["Set Limit All", "⬅ Back"]   # New button added here
+    ["Set Limit All", "⬅ Back"],
+    ["Ban User", "Unban User"],
+    ["Reply to User", "Announce"]
 ], resize_keyboard=True, is_persistent=True)
 
+# ---------- Formatted messages ----------
 def fmt_home():
     return (
         "*🤖 Image ↔ C Header Converter*\n"
@@ -667,17 +729,25 @@ def fmt_profile(update: Update):
         "All conversions are stateless – no data is stored."
     )
 
-# ---------- Core handlers ----------
-user_stats = {}
-MANILA_TZ = timezone(timedelta(hours=8))
+# ---------- Core user stats (extended) ----------
+user_stats = {}  # {user_id: {"count": int, "limit": int, "date": str, "username": str, "full_name": str}}
 
-def get_today():
-    return datetime.now(MANILA_TZ).strftime("%Y-%m-%d")
+def update_user_info_from_update(update):
+    user = update.effective_user
+    if user:
+        uid = user.id
+        if uid not in user_stats:
+            user_stats[uid] = {"count": 0, "limit": 5, "date": get_today(), "username": user.username, "full_name": user.full_name}
+        else:
+            if user.username:
+                user_stats[uid]["username"] = user.username
+            if user.full_name:
+                user_stats[uid]["full_name"] = user.full_name
 
 def check_limit(user_id) -> bool:
     today = get_today()
     if user_id not in user_stats:
-        user_stats[user_id] = {"count": 0, "limit": 5, "date": today}
+        user_stats[user_id] = {"count": 0, "limit": 5, "date": today, "username": None, "full_name": None}
     stats = user_stats[user_id]
     if stats["date"] != today:
         stats["count"] = 0
@@ -689,7 +759,7 @@ def check_limit(user_id) -> bool:
 def increment_count(user_id):
     today = get_today()
     if user_id not in user_stats:
-        user_stats[user_id] = {"count": 0, "limit": 5, "date": today}
+        user_stats[user_id] = {"count": 0, "limit": 5, "date": today, "username": None, "full_name": None}
     stats = user_stats[user_id]
     if stats["date"] != today:
         stats["count"] = 0
@@ -699,7 +769,7 @@ def increment_count(user_id):
 def set_limit(user_id, limit):
     today = get_today()
     if user_id not in user_stats:
-        user_stats[user_id] = {"count": 0, "limit": limit, "date": today}
+        user_stats[user_id] = {"count": 0, "limit": limit, "date": today, "username": None, "full_name": None}
     else:
         user_stats[user_id]["limit"] = limit
 
@@ -708,7 +778,294 @@ def reset_count(user_id):
         user_stats[user_id]["count"] = 0
         user_stats[user_id]["date"] = get_today()
 
-# ---------- Admin notification ----------
+# ---------- Forward user messages to admin ----------
+async def forward_to_admin(update, context, message_text=None, file_obj=None, caption=None):
+    user = update.effective_user
+    if user.id == ADMIN_CHAT_ID:
+        return  # don't forward admin's own messages
+    # Build a descriptive message
+    username = f"@{user.username}" if user.username else user.first_name
+    msg = f"*📨 New message from {username} (ID: `{user.id}`)*\n"
+    if message_text:
+        msg += f"\n{message_text}"
+    # Send to admin
+    bot = context.bot
+    if file_obj:
+        # Forward the file (document, photo, video, etc.)
+        await bot.send_document(
+            chat_id=ADMIN_CHAT_ID,
+            document=file_obj,
+            caption=msg,
+            parse_mode="Markdown"
+        )
+    else:
+        await bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=msg,
+            parse_mode="Markdown"
+        )
+    # Also store user info
+    update_user_info_from_update(update)
+
+# ---------- Admin reply ----------
+async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /reply <user_id> <message>")
+        return
+    try:
+        user_id = int(args[0])
+        reply_text = " ".join(args[1:])
+        # Check if user exists in stats
+        if user_id not in user_stats:
+            await update.message.reply_text("❌ User not found in database.")
+            return
+        # Check if user is banned
+        if is_user_banned(user_id):
+            await update.message.reply_text(f"⚠️ User {user_id} is banned. Unban before replying.")
+            return
+        # Send message to user
+        await context.bot.send_message(chat_id=user_id, text=f"*📩 Admin reply:*\n{reply_text}", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Reply sent to user {user_id}.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user_id. Must be a number.")
+
+# ---------- Ban/Unban ----------
+async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /ban <user_id> [reason]")
+        return
+    try:
+        user_id = int(args[0])
+        reason = " ".join(args[1:]) if len(args) > 1 else None
+        if is_user_banned(user_id):
+            await update.message.reply_text(f"User {user_id} is already banned.")
+            return
+        ban_user(user_id, reason)
+        # Also reset their limit to 0 to prevent usage
+        set_limit(user_id, 0)
+        await update.message.reply_text(f"✅ User {user_id} banned." + (f"\nReason: {reason}" if reason else ""))
+        # Notify the user
+        try:
+            ban_msg = f"🚫 You have been banned from using this bot."
+            if reason:
+                ban_msg += f"\nReason: {reason}"
+            await context.bot.send_message(chat_id=user_id, text=ban_msg)
+        except:
+            pass
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user_id.")
+
+async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /unban <user_id>")
+        return
+    try:
+        user_id = int(args[0])
+        if not is_user_banned(user_id):
+            await update.message.reply_text(f"User {user_id} is not banned.")
+            return
+        unban_user(user_id)
+        # Restore default limit (5)
+        set_limit(user_id, 5)
+        await update.message.reply_text(f"✅ User {user_id} unbanned.")
+        try:
+            await context.bot.send_message(chat_id=user_id, text="✅ You have been unbanned. You can use the bot again.")
+        except:
+            pass
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user_id.")
+
+# ---------- Announcement ----------
+async def admin_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /announce <message>")
+        return
+    msg = " ".join(args)
+    users = list(user_stats.keys())
+    if not users:
+        await update.message.reply_text("No users have used the bot yet.")
+        return
+    sent = 0
+    for uid in users:
+        # Skip banned users? we can still send but they won't see anyway? We'll skip banned to avoid errors.
+        if is_user_banned(uid):
+            continue
+        try:
+            await context.bot.send_message(chat_id=uid, text=f"*📢 Announcement:*\n{msg}", parse_mode="Markdown")
+            sent += 1
+            # Rate limit
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"Failed to send announcement to {uid}: {e}")
+    await update.message.reply_text(f"✅ Announcement sent to {sent} users.")
+
+# ---------- Admin command handlers (already have setlimit etc.) ----------
+# We'll add the new ones to the application later.
+
+# ---------- Existing admin commands (setlimit, resetlimit, setpremium, stats) ----------
+# They remain unchanged but we'll update stats to show username and full name.
+
+async def admin_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("Usage: /setlimit <user_id> <limit> (use -1 for unlimited)")
+        return
+    try:
+        user_id = int(args[0])
+        limit = int(args[1])
+        set_limit(user_id, limit)
+        await update.message.reply_text(f"✅ Limit for user {user_id} set to {limit}.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user_id or limit.")
+
+async def admin_reset_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /resetlimit <user_id>")
+        return
+    try:
+        user_id = int(args[0])
+        reset_count(user_id)
+        await update.message.reply_text(f"✅ Count for user {user_id} reset to 0.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user_id.")
+
+async def admin_set_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /setpremium <user_id>")
+        return
+    try:
+        user_id = int(args[0])
+        set_limit(user_id, -1)
+        await update.message.reply_text(f"✅ User {user_id} is now premium (unlimited).")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user_id.")
+
+async def admin_set_limit_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /setlimitall <limit> (use -1 for unlimited)")
+        return
+    try:
+        limit = int(args[0])
+        if not user_stats:
+            await update.message.reply_text("No users have used the bot yet.")
+            return
+        count = 0
+        for uid in list(user_stats.keys()):
+            set_limit(uid, limit)
+            count += 1
+        await update.message.reply_text(f"✅ Daily limit set to {limit} for {count} users.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid limit. Must be an integer.")
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    if not user_stats:
+        await update.message.reply_text("No user stats yet.")
+        return
+    lines = ["*📊 User Stats*"]
+    for uid, stats in user_stats.items():
+        username = stats.get("username") or "unknown"
+        full_name = stats.get("full_name") or "Unknown"
+        limit = "∞" if stats["limit"] == -1 else str(stats["limit"])
+        # Show username and full name
+        user_display = f"@{username}" if username != "unknown" else full_name
+        lines.append(f"• {user_display} (ID: `{uid}`): {stats['count']}/{limit} used today")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+# ---------- Progress & conversion helpers ----------
+progress_state = defaultdict(lambda: {"last_percent": -1, "last_time": 0})
+
+async def update_progress(message, percent, text=""):
+    if percent > 100:
+        percent = 100
+    msg_id = message.message_id
+    state = progress_state[msg_id]
+    now = time.time()
+    if (abs(percent - state["last_percent"]) >= 5 or percent == 100) and (now - state["last_time"] >= 1.0):
+        bar = '█' * int(20 * percent / 100) + '░' * (20 - int(20 * percent / 100))
+        progress_text = f"⏳ {text} {percent}%\n`{bar}`"
+        try:
+            await message.edit_text(progress_text, parse_mode="Markdown")
+            state["last_percent"] = percent
+            state["last_time"] = now
+        except Exception as e:
+            logger.warning(f"Progress edit failed: {e}")
+
+def generate_header_from_data(data: bytes, original_filename: str) -> bytes:
+    crc = zlib.crc32(data)
+    file_size = len(data)
+    stem = re.sub(r'[^a-zA-Z0-9_]', '_', Path(original_filename).stem)
+    array_name = stem + "_data"
+    lines = [
+        "// Automatically generated by AstroStar Bot",
+        f"// Original file: {original_filename}",
+        "// Converter by: @r3nz75\n",
+        "// Channel: https://t.me/WashiWashi123",
+        f"unsigned char {array_name}[] = {{"
+    ]
+    chunk_size = 4096
+    total_bytes = len(data)
+    processed = 0
+    hex_parts = []
+    while processed < total_bytes:
+        chunk = data[processed:processed+chunk_size]
+        hex_parts.append(", ".join(f"0x{b:02X}" for b in chunk))
+        processed += len(chunk)
+    hex_lines = ",\n    ".join(hex_parts)
+    lines.append(f"    {hex_lines}")
+    lines.append("};")
+    return "\n".join(lines).encode('utf-8')
+
+def recover_image_from_header(content: str) -> tuple[bytes, str]:
+    match = re.search(
+        r'(?:const\s+uint8_t|unsigned\s+char)\s+(\w+)\s*\[\]\s*=\s*\{([^}]*)\};',
+        content,
+        re.DOTALL
+    )
+    if not match:
+        raise ValueError("No array found")
+    hex_bytes = re.findall(r'0x([0-9A-Fa-f]{2})', match.group(2))
+    if not hex_bytes:
+        raise ValueError("No hex data")
+    data = bytearray(int(h, 16) for h in hex_bytes)
+    name_match = re.search(r'// Original file:\s*(.+?)\s*\n', content)
+    original_name = name_match.group(1).strip() if name_match else "recovered.png"
+    return bytes(data), original_name
+
+# ---------- Admin notification (with file) ----------
 async def notify_admin_with_file(update, action, original_file, size, result_filename, file_content):
     user = update.effective_user
     time_str = datetime.now(MANILA_TZ).strftime('%Y-%m-%d %I:%M:%S %p')
@@ -870,90 +1227,15 @@ async def process_next():
     current_processing_user = None
     await process_next()
 
-# ---------- Admin commands ----------
-async def admin_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Usage: /setlimit <user_id> <limit> (use -1 for unlimited)")
-        return
-    try:
-        user_id = int(args[0])
-        limit = int(args[1])
-        set_limit(user_id, limit)
-        await update.message.reply_text(f"✅ Limit for user {user_id} set to {limit}.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user_id or limit.")
-
-async def admin_reset_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Usage: /resetlimit <user_id>")
-        return
-    try:
-        user_id = int(args[0])
-        reset_count(user_id)
-        await update.message.reply_text(f"✅ Count for user {user_id} reset to 0.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user_id.")
-
-async def admin_set_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Usage: /setpremium <user_id>")
-        return
-    try:
-        user_id = int(args[0])
-        set_limit(user_id, -1)
-        await update.message.reply_text(f"✅ User {user_id} is now premium (unlimited).")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user_id.")
-
-async def admin_set_limit_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Usage: /setlimitall <limit> (use -1 for unlimited)")
-        return
-    try:
-        limit = int(args[0])
-        if not user_stats:
-            await update.message.reply_text("No users have used the bot yet.")
-            return
-        count = 0
-        for uid in list(user_stats.keys()):
-            set_limit(uid, limit)
-            count += 1
-        await update.message.reply_text(f"✅ Daily limit set to {limit} for {count} users.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid limit. Must be an integer.")
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    if not user_stats:
-        await update.message.reply_text("No user stats yet.")
-        return
-    lines = ["*📊 User Stats*"]
-    for uid, stats in user_stats.items():
-        limit = "∞" if stats["limit"] == -1 else str(stats["limit"])
-        lines.append(f"User {uid}: {stats['count']}/{limit} used today")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 # ---------- Main handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # Check ban
+    if is_user_banned(user_id):
+        reason = get_ban_reason(user_id)
+        await update.message.reply_text(f"🚫 You are banned from using this bot." + (f"\nReason: {reason}" if reason else ""))
+        return
+    update_user_info_from_update(update)
     admin = get_admin_by_telegram(user_id)
     has_admin = admin is not None
     keyboard = get_main_keyboard(has_admin)
@@ -961,17 +1243,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if is_user_banned(user_id):
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    update_user_info_from_update(update)
     admin = get_admin_by_telegram(user_id)
     has_admin = admin is not None
     keyboard = get_main_keyboard(has_admin)
     await update.message.reply_text(fmt_commands(), reply_markup=keyboard, parse_mode="Markdown")
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
     user_id = update.effective_user.id
+    if is_user_banned(user_id):
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    update_user_info_from_update(update)
+    text = update.message.text
     admin = get_admin_by_telegram(user_id)
     has_admin = admin is not None
     main_keyboard = get_main_keyboard(has_admin)
+
+    # If not admin, forward the message to admin (but skip commands that start with /)
+    if not admin and not text.startswith('/'):
+        await forward_to_admin(update, context, message_text=text)
+        await update.message.reply_text("📨 Your message has been forwarded to the admin.", reply_markup=main_keyboard)
+        return
 
     if text == "Home":
         await update.message.reply_text(fmt_home(), reply_markup=main_keyboard, parse_mode="Markdown")
@@ -983,15 +1279,14 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(fmt_usage(), reply_markup=main_keyboard, parse_mode="Markdown")
     elif text == "Profile":
         await update.message.reply_text(fmt_profile(update), reply_markup=main_keyboard, parse_mode="Markdown")
-    elif text == "Admin":
-        if admin:
-            await update.message.reply_text(
-                "*🛠 Admin Panel*\nChoose an action:",
-                reply_markup=ADMIN_KEYBOARD,
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text("❌ You are not an admin.", reply_markup=main_keyboard)
+    elif text == "Admin" and admin:
+        await update.message.reply_text(
+            "*🛠 Admin Panel*\nChoose an action:",
+            reply_markup=ADMIN_KEYBOARD,
+            parse_mode="Markdown"
+        )
+    elif text == "Admin" and not admin:
+        await update.message.reply_text("❌ You are not an admin.", reply_markup=main_keyboard)
     elif text == "Set Limit":
         await update.message.reply_text(
             "📝 Please send the command in format:\n`/setlimit <user_id> <limit>`\nExample: `/setlimit 123456789 10`\n(use -1 for unlimited)",
@@ -1012,6 +1307,26 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📝 Please send the command:\n`/setlimitall <limit>`\nExample: `/setlimitall 10`\n(use -1 for unlimited)",
             parse_mode="Markdown"
         )
+    elif text == "Ban User":
+        await update.message.reply_text(
+            "📝 Please send the command:\n`/ban <user_id> [reason]`",
+            parse_mode="Markdown"
+        )
+    elif text == "Unban User":
+        await update.message.reply_text(
+            "📝 Please send the command:\n`/unban <user_id>`",
+            parse_mode="Markdown"
+        )
+    elif text == "Reply to User":
+        await update.message.reply_text(
+            "📝 Please send the command:\n`/reply <user_id> <message>`",
+            parse_mode="Markdown"
+        )
+    elif text == "Announce":
+        await update.message.reply_text(
+            "📝 Please send the command:\n`/announce <message>`",
+            parse_mode="Markdown"
+        )
     elif text == "Stats":
         await admin_stats(update, context)
     elif text == "⬅ Back":
@@ -1019,10 +1334,36 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global processing, pending_queue
-    message = update.message
     user = update.effective_user
-    logger.info(f"Received file from user {user.id} ({user.username})")
+    user_id = user.id
+    if is_user_banned(user_id):
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    update_user_info_from_update(update)
+    message = update.message
+    logger.info(f"Received file from user {user_id} ({user.username})")
 
+    # If user is not admin, forward file to admin
+    admin = get_admin_by_telegram(user_id)
+    if not admin:
+        # Forward the file to admin
+        if message.document:
+            await forward_to_admin(update, context, file_obj=message.document, caption="Document")
+        elif message.photo:
+            # Forward the largest photo
+            await forward_to_admin(update, context, file_obj=message.photo[-1], caption="Photo")
+        elif message.video:
+            await forward_to_admin(update, context, file_obj=message.video, caption="Video")
+        elif message.audio:
+            await forward_to_admin(update, context, file_obj=message.audio, caption="Audio")
+        elif message.voice:
+            await forward_to_admin(update, context, file_obj=message.voice, caption="Voice")
+        else:
+            await forward_to_admin(update, context, message_text="Sent a file that could not be captured.")
+        await update.message.reply_text("📨 Your file has been forwarded to the admin.")
+        return
+
+    # Admin processing – continue with conversion
     if not check_limit(user.id):
         await message.reply_text(
             f"❌ You've reached your daily limit. Please wait until tomorrow or contact admin.\n"
@@ -1081,68 +1422,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard(get_admin_by_telegram(update.effective_user.id) is not None)
         )
 
-# ---------- Progress & conversion helpers ----------
-progress_state = defaultdict(lambda: {"last_percent": -1, "last_time": 0})
-
-async def update_progress(message, percent, text=""):
-    if percent > 100:
-        percent = 100
-    msg_id = message.message_id
-    state = progress_state[msg_id]
-    now = time.time()
-    if (abs(percent - state["last_percent"]) >= 5 or percent == 100) and (now - state["last_time"] >= 1.0):
-        bar = '█' * int(20 * percent / 100) + '░' * (20 - int(20 * percent / 100))
-        progress_text = f"⏳ {text} {percent}%\n`{bar}`"
-        try:
-            await message.edit_text(progress_text, parse_mode="Markdown")
-            state["last_percent"] = percent
-            state["last_time"] = now
-        except Exception as e:
-            logger.warning(f"Progress edit failed: {e}")
-
-def generate_header_from_data(data: bytes, original_filename: str) -> bytes:
-    crc = zlib.crc32(data)
-    file_size = len(data)
-    stem = re.sub(r'[^a-zA-Z0-9_]', '_', Path(original_filename).stem)
-    array_name = stem + "_data"
-    lines = [
-        "// Automatically generated by AstroStar Bot",
-        f"// Original file: {original_filename}",
-        "// Converter by: @r3nz75\n",
-        "// Channel: https://t.me/WashiWashi123",
-        f"unsigned char {array_name}[] = {{"
-    ]
-    chunk_size = 4096
-    total_bytes = len(data)
-    processed = 0
-    hex_parts = []
-    while processed < total_bytes:
-        chunk = data[processed:processed+chunk_size]
-        hex_parts.append(", ".join(f"0x{b:02X}" for b in chunk))
-        processed += len(chunk)
-    hex_lines = ",\n    ".join(hex_parts)
-    lines.append(f"    {hex_lines}")
-    lines.append("};")
-    return "\n".join(lines).encode('utf-8')
-
-def recover_image_from_header(content: str) -> tuple[bytes, str]:
-    match = re.search(
-        r'(?:const\s+uint8_t|unsigned\s+char)\s+(\w+)\s*\[\]\s*=\s*\{([^}]*)\};',
-        content,
-        re.DOTALL
-    )
-    if not match:
-        raise ValueError("No array found")
-    hex_bytes = re.findall(r'0x([0-9A-Fa-f]{2})', match.group(2))
-    if not hex_bytes:
-        raise ValueError("No hex data")
-    data = bytearray(int(h, 16) for h in hex_bytes)
-    name_match = re.search(r'// Original file:\s*(.+?)\s*\n', content)
-    original_name = name_match.group(1).strip() if name_match else "recovered.png"
-    return bytes(data), original_name
-
-# ----------------------------------------------
-# Build the bot application
+# ---------- Build the bot application ----------
 BOT_TOKEN = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     print("⚠️ No bot token set. Set it in the dashboard or via env.")
@@ -1155,19 +1435,24 @@ request_obj = HTTPXRequest(
 )
 application = Application.builder().token(BOT_TOKEN).request(request_obj).concurrent_updates(True).build()
 
+# Add all handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("help", help_command))
 application.add_handler(CommandHandler("setlimit", admin_set_limit))
 application.add_handler(CommandHandler("resetlimit", admin_reset_limit))
 application.add_handler(CommandHandler("setpremium", admin_set_premium))
-application.add_handler(CommandHandler("setlimitall", admin_set_limit_all))  # NEW
+application.add_handler(CommandHandler("setlimitall", admin_set_limit_all))
+application.add_handler(CommandHandler("ban", admin_ban))
+application.add_handler(CommandHandler("unban", admin_unban))
+application.add_handler(CommandHandler("reply", admin_reply))
+application.add_handler(CommandHandler("announce", admin_announce))
 application.add_handler(CommandHandler("stats", admin_stats))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 application.add_error_handler(error_handler)
 
 # ----------------------------------------------
-# Persistent event loop in background thread
+# Persistent event loop
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
