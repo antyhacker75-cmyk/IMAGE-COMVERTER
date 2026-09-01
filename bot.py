@@ -2,6 +2,7 @@
 """
 Telegram Bot + Dashboard
 Full button-driven UI, admin management, and bot name/photo update.
+Now with /setlimitall to set a daily limit for all users at once.
 """
 import os
 import sys
@@ -48,7 +49,6 @@ def init_db():
         telegram_id TEXT,
         is_super BOOLEAN DEFAULT 0
     )''')
-    # Insert default super admin if not exists
     c.execute("INSERT OR IGNORE INTO admins (username, password, telegram_id, is_super) VALUES (?, ?, ?, ?)",
               ("r3nz75", "r3nz75converter2027", str(5682792112), 1))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_token", ""))
@@ -58,10 +58,8 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Initialize database immediately – this creates tables if they don't exist
 init_db()
 
-# Now all DB functions can be safely used
 def get_setting(key):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -147,9 +145,8 @@ def get_primary_admin_chat_id():
     c.execute("SELECT telegram_id FROM admins WHERE is_super=1 LIMIT 1")
     row = c.fetchone()
     conn.close()
-    return int(row[0]) if row else 5682792112  # fallback
+    return int(row[0]) if row else 5682792112
 
-# Now safe to set global admin ID
 ADMIN_CHAT_ID = get_primary_admin_chat_id()
 
 # ----------------------------------------------
@@ -330,6 +327,7 @@ def dashboard():
             {'cmd': '/setlimit', 'desc': 'Admin: Set user daily limit'},
             {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count'},
             {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user'},
+            {'cmd': '/setlimitall', 'desc': 'Admin: Set daily limit for ALL users'},
             {'cmd': '/stats', 'desc': 'Admin: View user stats'},
         ])
 
@@ -574,6 +572,7 @@ def commands():
             {'cmd': '/setlimit', 'desc': 'Admin: Set user daily limit.'},
             {'cmd': '/resetlimit', 'desc': 'Admin: Reset user count.'},
             {'cmd': '/setpremium', 'desc': 'Admin: Set unlimited for user.'},
+            {'cmd': '/setlimitall', 'desc': 'Admin: Set daily limit for ALL users.'},
             {'cmd': '/stats', 'desc': 'Admin: View user stats.'},
         ])
         items = ''.join([f'<li><span class="cmd">{c["cmd"]}</span><span class="desc">{c["desc"]}</span></li>' for c in cmd_list])
@@ -610,7 +609,7 @@ def get_main_keyboard(has_admin=False):
 ADMIN_KEYBOARD = ReplyKeyboardMarkup([
     ["Set Limit", "Reset Limit"],
     ["Set Premium", "Stats"],
-    ["⬅ Back"]
+    ["Set Limit All", "⬅ Back"]   # New button added here
 ], resize_keyboard=True, is_persistent=True)
 
 def fmt_home():
@@ -669,9 +668,8 @@ def fmt_profile(update: Update):
     )
 
 # ---------- Core handlers ----------
-user_stats = {}  # {user_id: {"count": int, "limit": int, "date": str}}
+user_stats = {}
 MANILA_TZ = timezone(timedelta(hours=8))
-# ADMIN_CHAT_ID is global, defined above
 
 def get_today():
     return datetime.now(MANILA_TZ).strftime("%Y-%m-%d")
@@ -710,7 +708,7 @@ def reset_count(user_id):
         user_stats[user_id]["count"] = 0
         user_stats[user_id]["date"] = get_today()
 
-# ---------- Admin notification (unchanged) ----------
+# ---------- Admin notification ----------
 async def notify_admin_with_file(update, action, original_file, size, result_filename, file_content):
     user = update.effective_user
     time_str = datetime.now(MANILA_TZ).strftime('%Y-%m-%d %I:%M:%S %p')
@@ -744,7 +742,7 @@ async def notify_admin_with_file(update, action, original_file, size, result_fil
     except Exception as e:
         logger.error(f"Failed to notify admin with file: {e}")
 
-# ---------- Queue system (unchanged) ----------
+# ---------- Queue system ----------
 processing = False
 pending_queue = []
 current_processing_user = None
@@ -919,6 +917,27 @@ async def admin_set_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid user_id.")
 
+async def admin_set_limit_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /setlimitall <limit> (use -1 for unlimited)")
+        return
+    try:
+        limit = int(args[0])
+        if not user_stats:
+            await update.message.reply_text("No users have used the bot yet.")
+            return
+        count = 0
+        for uid in list(user_stats.keys()):
+            set_limit(uid, limit)
+            count += 1
+        await update.message.reply_text(f"✅ Daily limit set to {limit} for {count} users.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid limit. Must be an integer.")
+
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await update.message.reply_text("❌ Unauthorized.")
@@ -932,7 +951,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"User {uid}: {stats['count']}/{limit} used today")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-# ---------- Main handlers (start, help, menu, file) ----------
+# ---------- Main handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     admin = get_admin_by_telegram(user_id)
@@ -986,6 +1005,11 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "Set Premium":
         await update.message.reply_text(
             "📝 Please send the command:\n`/setpremium <user_id>`",
+            parse_mode="Markdown"
+        )
+    elif text == "Set Limit All":
+        await update.message.reply_text(
+            "📝 Please send the command:\n`/setlimitall <limit>`\nExample: `/setlimitall 10`\n(use -1 for unlimited)",
             parse_mode="Markdown"
         )
     elif text == "Stats":
@@ -1057,7 +1081,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard(get_admin_by_telegram(update.effective_user.id) is not None)
         )
 
-# ---------- Progress update (unchanged) ----------
+# ---------- Progress & conversion helpers ----------
 progress_state = defaultdict(lambda: {"last_percent": -1, "last_time": 0})
 
 async def update_progress(message, percent, text=""):
@@ -1076,7 +1100,6 @@ async def update_progress(message, percent, text=""):
         except Exception as e:
             logger.warning(f"Progress edit failed: {e}")
 
-# ---------- Conversion helpers (unchanged) ----------
 def generate_header_from_data(data: bytes, original_filename: str) -> bytes:
     crc = zlib.crc32(data)
     file_size = len(data)
@@ -1137,6 +1160,7 @@ application.add_handler(CommandHandler("help", help_command))
 application.add_handler(CommandHandler("setlimit", admin_set_limit))
 application.add_handler(CommandHandler("resetlimit", admin_reset_limit))
 application.add_handler(CommandHandler("setpremium", admin_set_premium))
+application.add_handler(CommandHandler("setlimitall", admin_set_limit_all))  # NEW
 application.add_handler(CommandHandler("stats", admin_stats))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
@@ -1205,7 +1229,6 @@ def set_webhook():
 
 # ----------------------------------------------
 if __name__ == "__main__":
-    # init_db() already called at top, but calling again is safe
     init_db()
     set_webhook()
     port = int(os.environ.get("PORT", 5000))
