@@ -499,16 +499,17 @@ def console():
             })
         # Reverse so newest is at bottom
         lines.reverse()
-        content = f"""
+        # --- FIX: Use a regular string (not f-string) for the template block ---
+        content = """
         <div class="card">
             <h3><i class="fas fa-terminal"></i> Live Console</h3>
             <p>Auto-refreshes every 3 seconds.</p>
             <div class="console-container" id="consoleContainer">
                 {% for line in lines %}
                 <div class="console-line">
-                    <span class="time">{line['time']}</span>
-                    <span class="{'admin' if line['is_admin'] else 'user'}">{line['username']}</span>
-                    <span class="text">{line['message']}</span>
+                    <span class="time">{{ line.time }}</span>
+                    <span class="{% if line.is_admin %}admin{% else %}user{% endif %}">{{ line.username }}</span>
+                    <span class="text">{{ line.message }}</span>
                 </div>
                 {% endfor %}
             </div>
@@ -522,25 +523,26 @@ def console():
             </form>
         </div>
         <script>
-        function refreshConsole() {{
+        function refreshConsole() {
             fetch('/console_data')
                 .then(response => response.json())
-                .then(data => {{
+                .then(data => {
                     const container = document.getElementById('consoleContainer');
                     container.innerHTML = '';
-                    data.reverse().forEach(line => {{
+                    data.reverse().forEach(line => {
                         const div = document.createElement('div');
                         div.className = 'console-line';
-                        div.innerHTML = `<span class="time">${{line.time}}</span> <span class="${{line.is_admin ? 'admin' : 'user'}}">${{line.username}}</span> <span class="text">${{line.message}}</span>`;
+                        div.innerHTML = `<span class="time">${line.time}</span> <span class="${line.is_admin ? 'admin' : 'user'}">${line.username}</span> <span class="text">${line.message}</span>`;
                         container.appendChild(div);
-                    }});
+                    });
                     container.scrollTop = container.scrollHeight;
-                }});
-        }}
+                });
+        }
         setInterval(refreshConsole, 3000);
         </script>
         """
-        return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', '{% block content %}' + content + '{% endblock %}'), active='console', lines=lines)
+        # Now render with the base layout, passing `lines` as context
+        return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', content), active='console', lines=lines)
     except Exception as e:
         logger.error(f"Console error: {e}")
         return "Internal Server Error", 500
@@ -571,7 +573,6 @@ def send_reply():
         if not user_id or not message:
             flash('Missing user_id or message.', 'danger')
             return redirect(url_for('console'))
-        # Send via bot
         token = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
         if token:
             import requests
