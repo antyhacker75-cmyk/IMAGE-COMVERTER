@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot + Dashboard
-Modern UI, console, real-time clock, user stats, admin panel.
+Modern UI, console, real-time clock, user stats, admin panel + Leak feature.
 """
 import os
 import sys
@@ -21,8 +21,8 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 from flask import Flask, request, render_template_string, redirect, url_for, session, flash, abort, jsonify
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 
 # ----------------------------------------------
@@ -65,7 +65,21 @@ def init_db():
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         is_admin BOOLEAN DEFAULT 0
     )''')
-    # Insert default super admin (new ID: 6064653643)
+    c.execute('''CREATE TABLE IF NOT EXISTS leak_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        original_message_id INTEGER,
+        original_chat_id INTEGER,
+        caption TEXT,
+        file_id TEXT,
+        file_type TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        target_id INTEGER,
+        hide_sender BOOLEAN DEFAULT 0,
+        hide_caption BOOLEAN DEFAULT 0
+    )''')
     c.execute("INSERT OR IGNORE INTO admins (username, password, telegram_id, is_super) VALUES (?, ?, ?, ?)",
               ("r3nz75", "r3nz75converter2027", str(6064653643), 1))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_token", ""))
@@ -235,6 +249,53 @@ def get_recent_messages(limit=100):
     conn.close()
     return rows
 
+# ---- Leak helpers ----
+def create_leak_request(user_id, username, original_message_id, original_chat_id, caption, file_id, file_type):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT INTO leak_requests 
+                 (user_id, username, original_message_id, original_chat_id, caption, file_id, file_type) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+              (user_id, username, original_message_id, original_chat_id, caption, file_id, file_type))
+    leak_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return leak_id
+
+def get_pending_leaks():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, username, caption, file_id, file_type, created_at FROM leak_requests WHERE status='pending' ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_leak(leak_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM leak_requests WHERE id=?", (leak_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def update_leak_status(leak_id, status, target_id=None, hide_sender=0, hide_caption=0):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""UPDATE leak_requests 
+                 SET status=?, target_id=?, hide_sender=?, hide_caption=?
+                 WHERE id=?""",
+              (status, target_id, hide_sender, hide_caption, leak_id))
+    conn.commit()
+    conn.close()
+
+def get_all_leaks(limit=100):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, username, caption, file_id, file_type, status, target_id, hide_sender, hide_caption, created_at FROM leak_requests ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # ----------------------------------------------
 # Flask app – Responsive Dashboard
 app = Flask(__name__)
@@ -359,6 +420,7 @@ BASE_LAYOUT = """
         <h2><i class="fas fa-robot"></i> Bot Control</h2>
         <a href="{{ url_for('dashboard') }}" class="{% if active == 'dashboard' %}active{% endif %}"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
         <a href="{{ url_for('console') }}" class="{% if active == 'console' %}active{% endif %}"><i class="fas fa-terminal"></i> Console</a>
+        <a href="{{ url_for('leaks') }}" class="{% if active == 'leaks' %}active{% endif %}"><i class="fas fa-file-export"></i> Leaks</a>
         <a href="{{ url_for('settings') }}" class="{% if active == 'settings' %}active{% endif %}"><i class="fas fa-cog"></i> Settings</a>
         <a href="{{ url_for('admin_management') }}" class="{% if active == 'admin' %}active{% endif %}"><i class="fas fa-users-cog"></i> Admins</a>
         <a href="{{ url_for('commands') }}" class="{% if active == 'commands' %}active{% endif %}"><i class="fas fa-list-ul"></i> Commands</a>
@@ -421,6 +483,7 @@ def dashboard():
         logo_url = get_setting('logo_url') or 'https://cdn-icons-png.flaticon.com/512/60/60580.png'
         token_display = bot_token[:8] + '...' if bot_token and len(bot_token) > 8 else 'Not set'
         total_users = get_total_users()
+        pending_leaks = len(get_pending_leaks())
         commands = [
             {'cmd': '/start', 'desc': 'Show welcome menu'},
             {'cmd': '/help', 'desc': 'Show help'},
@@ -446,6 +509,7 @@ def dashboard():
                 <div class="stat-item"><i class="fas fa-command"></i><div class="number">{len(commands)}</div><div class="label">Total Commands</div></div>
                 <div class="stat-item"><i class="fas fa-users"></i><div class="number">{len(get_all_admins())}</div><div class="label">Admin Users</div></div>
                 <div class="stat-item"><i class="fas fa-users"></i><div class="number">{total_users}</div><div class="label">Total Users</div></div>
+                <div class="stat-item"><i class="fas fa-file-export"></i><div class="number">{pending_leaks}</div><div class="label">Pending Leaks</div></div>
                 <div class="stat-item"><i class="fas fa-clock"></i><div class="number" id="serverTime">{now_str}</div><div class="label">Server Time</div></div>
             </div>
         </div>
@@ -459,7 +523,7 @@ def dashboard():
         <script>
         function updateClock() {{
             var now = new Date();
-            var offset = 8; // UTC+8
+            var offset = 8;
             var utc = now.getTime() + (now.getTimezoneOffset() * 60000);
             var local = new Date(utc + (3600000 * offset));
             var timeStr = local.getFullYear() + '-' +
@@ -484,22 +548,15 @@ def dashboard():
 def console():
     try:
         messages = get_recent_messages(200)
-        # Render console lines
         lines = []
         for msg in messages:
-            is_admin = msg[6]
-            prefix = "🤖 Admin" if is_admin else "👤 User"
-            username = msg[2] or f"User {msg[1]}"
             lines.append({
                 'time': msg[5],
-                'username': username,
+                'username': msg[2] or f"User {msg[1]}",
                 'message': msg[3],
-                'type': msg[4],
-                'is_admin': is_admin
+                'is_admin': msg[6]
             })
-        # Reverse so newest is at bottom
         lines.reverse()
-        # --- FIX: Use a regular string (not f-string) for the template block ---
         content = """
         <div class="card">
             <h3><i class="fas fa-terminal"></i> Live Console</h3>
@@ -541,7 +598,6 @@ def console():
         setInterval(refreshConsole, 3000);
         </script>
         """
-        # Now render with the base layout, passing `lines` as context
         return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', content), active='console', lines=lines)
     except Exception as e:
         logger.error(f"Console error: {e}")
@@ -587,6 +643,44 @@ def send_reply():
     except Exception as e:
         flash(f"Error: {e}", 'danger')
     return redirect(url_for('console'))
+
+@app.route('/leaks')
+@login_required
+def leaks():
+    try:
+        all_leaks = get_all_leaks(200)
+        leak_rows = ""
+        for l in all_leaks:
+            status = l[6]  # status
+            target = l[7] or 'Not set'
+            hide_sender = 'Yes' if l[8] else 'No'
+            hide_caption = 'Yes' if l[9] else 'No'
+            leak_rows += f"""
+            <tr>
+                <td>{l[1]}</td>
+                <td>{l[2] or 'Unknown'}</td>
+                <td>{l[3] or 'No caption'}</td>
+                <td>{l[5]}</td>
+                <td><span style="color:{'#f59e0b' if status=='pending' else '#10b981' if status=='deployed' else '#ef4444'};">{status}</span></td>
+                <td>{target}</td>
+                <td>{hide_sender}</td>
+                <td>{hide_caption}</td>
+                <td>{l[10]}</td>
+            </tr>
+            """
+        content = f"""
+        <div class="card">
+            <h3><i class="fas fa-file-export"></i> Leak Requests</h3>
+            <table class="admin-table">
+                <tr><th>User ID</th><th>Username</th><th>Caption</th><th>Type</th><th>Status</th><th>Target</th><th>Hide Sender</th><th>Hide Caption</th><th>Created</th></tr>
+                {leak_rows}
+            </table>
+        </div>
+        """
+        return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', content), active='leaks')
+    except Exception as e:
+        logger.error(f"Leaks error: {e}")
+        return "Internal Server Error", 500
 
 @app.route('/settings', methods=['GET', 'POST'])
 @login_required
@@ -768,19 +862,20 @@ def commands():
         return "Internal Server Error", 500
 
 # ----------------------------------------------
-# Telegram Bot – Modern HTML formatting
+# Telegram Bot – Modern HTML formatting + Leak feature
 # ----------------------------------------------
 
 def get_main_keyboard(has_admin=False):
+    # Add "📤 Leak" button for all users
     if has_admin:
         return ReplyKeyboardMarkup([
             ["🏠 Home", "🔄 Convert", "📋 Commands"],
-            ["ℹ️ Usage", "👤 Profile", "🛠 Admin"]
+            ["ℹ️ Usage", "👤 Profile", "🛠 Admin", "📤 Leak"]
         ], resize_keyboard=True, is_persistent=True)
     else:
         return ReplyKeyboardMarkup([
             ["🏠 Home", "🔄 Convert", "📋 Commands"],
-            ["ℹ️ Usage", "👤 Profile"]
+            ["ℹ️ Usage", "👤 Profile", "📤 Leak"]
         ], resize_keyboard=True, is_persistent=True)
 
 ADMIN_KEYBOARD = ReplyKeyboardMarkup([
@@ -788,10 +883,11 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup([
     ["⭐ Set Premium", "📈 Set Limit All"],
     ["📋 Stats", "🚫 Ban User"],
     ["✅ Unban User", "📢 Announcement"],
-    ["✉️ Reply to User", "⬅️ Back"]
+    ["✉️ Reply to User", "📤 Leak Requests"],
+    ["⬅️ Back"]
 ], resize_keyboard=True, is_persistent=True)
 
-# ---- Formatted messages with HTML ----
+# ---- Formatted messages ----
 def fmt_home():
     return (
         "<b>🤖 Image ↔ C Header Converter</b>\n"
@@ -837,10 +933,9 @@ def fmt_usage():
 
 def fmt_profile(update: Update):
     user = update.effective_user
-    # Get remaining conversions
     today = get_today()
     if user.id not in user_stats:
-        remaining = 5  # default limit
+        remaining = 5
     else:
         stats = user_stats[user.id]
         if stats["limit"] == -1:
@@ -859,7 +954,7 @@ def fmt_profile(update: Update):
         "All conversions are stateless – no data is stored."
     )
 
-# ---- User stats & limits (in-memory) ----
+# ---- User stats & limits ----
 user_stats = {}
 MANILA_TZ = timezone(timedelta(hours=8))
 
@@ -1183,6 +1278,217 @@ async def admin_reply_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to send: {e}", parse_mode="HTML")
 
+# ---- Leak handlers ----
+async def handle_leak_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Called when user sends a file or text after clicking '📤 Leak' button."""
+    user = update.effective_user
+    upsert_user(user.id, user.username, user.first_name, user.last_name)
+    if is_user_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.", parse_mode="HTML")
+        return
+
+    # Determine the message content
+    msg = update.message
+    file_id = None
+    file_type = None
+    caption = msg.caption or ""
+    if msg.document:
+        file_id = msg.document.file_id
+        file_type = "document"
+        file_name = msg.document.file_name or "file"
+        caption = f"{caption}\n📄 File: {file_name}"
+    elif msg.photo:
+        file_id = msg.photo[-1].file_id
+        file_type = "photo"
+    elif msg.video:
+        file_id = msg.video.file_id
+        file_type = "video"
+    elif msg.audio:
+        file_id = msg.audio.file_id
+        file_type = "audio"
+    elif msg.text:
+        file_id = None
+        file_type = "text"
+        caption = msg.text
+    else:
+        await msg.reply_text("❌ Unsupported media type. Please send a text, photo, video, audio, or document.", parse_mode="HTML")
+        return
+
+    # Create leak request
+    leak_id = create_leak_request(
+        user_id=user.id,
+        username=user.username or str(user.id),
+        original_message_id=msg.message_id,
+        original_chat_id=msg.chat.id,
+        caption=caption,
+        file_id=file_id,
+        file_type=file_type
+    )
+
+    # Notify admin with Accept / Reject inline buttons
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accept", callback_data=f"leak_accept_{leak_id}")],
+        [InlineKeyboardButton("❌ Reject", callback_data=f"leak_reject_{leak_id}")]
+    ])
+    admin_msg = await update.get_bot().send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=f"<b>📤 New Leak Request #{leak_id}</b>\n"
+             f"From: @{user.username or user.first_name} (ID: <code>{user.id}</code>)\n"
+             f"Type: {file_type}\n"
+             f"Caption: {caption or 'None'}\n"
+             f"Use buttons below.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+    # Store admin message ID in context for later? We can just rely on callback.
+
+    # Forward the original message to admin (so they see the actual content)
+    await msg.forward(chat_id=ADMIN_CHAT_ID)
+
+    await update.message.reply_text("✅ Your leak request has been sent to the admin for review.", parse_mode="HTML")
+
+async def leak_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle accept/reject callbacks from inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("leak_accept_"):
+        leak_id = int(data.split("_")[2])
+        # Start the accept workflow
+        context.user_data['leak_workflow'] = {'leak_id': leak_id, 'step': 'target'}
+        await query.edit_message_text(
+            f"✅ Leak #{leak_id} accepted.\n\n"
+            "Send the target user/group ID (numeric) to forward the message to.\n"
+            "Example: <code>123456789</code>\n"
+            "You can also send <code>cancel</code> to abort.",
+            parse_mode="HTML"
+        )
+    elif data.startswith("leak_reject_"):
+        leak_id = int(data.split("_")[2])
+        update_leak_status(leak_id, "rejected")
+        await query.edit_message_text(f"❌ Leak #{leak_id} has been rejected.")
+    else:
+        await query.edit_message_text("Unknown action.")
+
+async def handle_leak_workflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the multi-step admin workflow after accepting a leak."""
+    if not context.user_data.get('leak_workflow'):
+        return
+    workflow = context.user_data['leak_workflow']
+    leak_id = workflow['leak_id']
+    step = workflow.get('step', 'target')
+    text = update.message.text.strip()
+    if text.lower() == 'cancel':
+        update_leak_status(leak_id, "cancelled")
+        context.user_data.pop('leak_workflow', None)
+        await update.message.reply_text("❌ Leak deployment cancelled.", parse_mode="HTML")
+        return
+
+    if step == 'target':
+        if not text.isdigit():
+            await update.message.reply_text("❌ Please send a numeric user/group ID, or 'cancel'.", parse_mode="HTML")
+            return
+        workflow['target'] = int(text)
+        workflow['step'] = 'hide_sender'
+        await update.message.reply_text(
+            "📝 Hide sender name? (Send <b>yes</b> or <b>no</b>)",
+            parse_mode="HTML"
+        )
+    elif step == 'hide_sender':
+        if text.lower() not in ('yes', 'no'):
+            await update.message.reply_text("❌ Please send 'yes' or 'no'.", parse_mode="HTML")
+            return
+        workflow['hide_sender'] = 1 if text.lower() == 'yes' else 0
+        workflow['step'] = 'hide_caption'
+        await update.message.reply_text(
+            "📝 Hide original caption? (Send <b>yes</b> or <b>no</b>)",
+            parse_mode="HTML"
+        )
+    elif step == 'hide_caption':
+        if text.lower() not in ('yes', 'no'):
+            await update.message.reply_text("❌ Please send 'yes' or 'no'.", parse_mode="HTML")
+            return
+        workflow['hide_caption'] = 1 if text.lower() == 'yes' else 0
+        workflow['step'] = 'confirm'
+        # Fetch the leak details
+        leak = get_leak(leak_id)
+        if not leak:
+            await update.message.reply_text("❌ Leak request not found.", parse_mode="HTML")
+            context.user_data.pop('leak_workflow', None)
+            return
+        target = workflow['target']
+        hide_sender = workflow['hide_sender']
+        hide_caption = workflow['hide_caption']
+        # Build preview
+        preview = (
+            f"<b>📤 Leak #{leak_id} – Summary</b>\n"
+            f"Target: <code>{target}</code>\n"
+            f"Hide sender: {'Yes' if hide_sender else 'No'}\n"
+            f"Hide caption: {'Yes' if hide_caption else 'No'}\n\n"
+            "Reply with <b>deploy</b> to forward, or <b>cancel</b> to abort."
+        )
+        await update.message.reply_text(preview, parse_mode="HTML")
+    elif step == 'confirm':
+        if text.lower() == 'deploy':
+            leak = get_leak(leak_id)
+            if not leak:
+                await update.message.reply_text("❌ Leak not found.", parse_mode="HTML")
+                context.user_data.pop('leak_workflow', None)
+                return
+            target = workflow['target']
+            hide_sender = workflow['hide_sender']
+            hide_caption = workflow['hide_caption']
+            # Forward the original message with options
+            try:
+                # Get original message
+                chat_id = leak[4]  # original_chat_id
+                msg_id = leak[3]   # original_message_id
+                # Copy the message
+                await update.get_bot().copy_message(
+                    chat_id=target,
+                    from_chat_id=chat_id,
+                    message_id=msg_id,
+                    caption="" if hide_caption else leak[5],  # caption
+                    disable_notification=True,
+                    # We can't easily hide sender name with copy_message,
+                    # but we can forward without sender info by using send_* methods with file_id
+                    # Better: re-send the file with a custom caption.
+                )
+                # To hide sender, we re-send the file, not copy.
+                # Let's re-send using file_id
+                file_id = leak[6]
+                file_type = leak[7]
+                caption = "" if hide_caption else leak[5]
+                if file_type == 'photo':
+                    await update.get_bot().send_photo(chat_id=target, photo=file_id, caption=caption)
+                elif file_type == 'video':
+                    await update.get_bot().send_video(chat_id=target, video=file_id, caption=caption)
+                elif file_type == 'document':
+                    await update.get_bot().send_document(chat_id=target, document=file_id, caption=caption)
+                elif file_type == 'audio':
+                    await update.get_bot().send_audio(chat_id=target, audio=file_id, caption=caption)
+                elif file_type == 'text':
+                    await update.get_bot().send_message(chat_id=target, text=caption)
+                else:
+                    await update.message.reply_text("❌ Unsupported file type for forwarding.", parse_mode="HTML")
+                    return
+                # Update status
+                update_leak_status(leak_id, "deployed", target, hide_sender, hide_caption)
+                await update.message.reply_text(
+                    f"✅ Leak #{leak_id} deployed to {target}.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                await update.message.reply_text(f"❌ Failed to forward: {e}", parse_mode="HTML")
+            context.user_data.pop('leak_workflow', None)
+        elif text.lower() == 'cancel':
+            update_leak_status(leak_id, "cancelled")
+            context.user_data.pop('leak_workflow', None)
+            await update.message.reply_text("❌ Leak cancelled.", parse_mode="HTML")
+        else:
+            await update.message.reply_text("❌ Please reply with <b>deploy</b> or <b>cancel</b>.", parse_mode="HTML")
+
 # ---- Main handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1215,7 +1521,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_admin = admin is not None
     main_keyboard = get_main_keyboard(has_admin)
 
-    # Log non-admin messages
     if not admin:
         log_message(user.id, user.username or str(user.id), text, "text")
 
@@ -1229,6 +1534,14 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(fmt_usage(), reply_markup=main_keyboard, parse_mode="HTML")
     elif text == "👤 Profile":
         await update.message.reply_text(fmt_profile(update), reply_markup=main_keyboard, parse_mode="HTML")
+    elif text == "📤 Leak":
+        await update.message.reply_text(
+            "📤 Send the file or message you want to leak.\n"
+            "I will forward it to the admin for approval.",
+            parse_mode="HTML"
+        )
+        # Set a flag to capture the next message as leak content
+        context.user_data['leak_mode'] = True
     elif text == "🛠 Admin":
         if admin:
             await update.message.reply_text(
@@ -1261,18 +1574,33 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Or use <code>/reply &lt;user_id&gt; &lt;message&gt;</code> for text only.",
             parse_mode="HTML"
         )
+    elif text == "📤 Leak Requests":
+        pending = get_pending_leaks()
+        if not pending:
+            await update.message.reply_text("No pending leak requests.", parse_mode="HTML")
+        else:
+            msg = "<b>📤 Pending Leak Requests</b>\n"
+            for p in pending:
+                msg += f"#{p[0]} – from @{p[2]} ({p[1]}) – {p[5]}\n"
+            await update.message.reply_text(msg, parse_mode="HTML")
     elif text == "⬅️ Back":
         await update.message.reply_text("↩️ Back to main menu.", reply_markup=main_keyboard, parse_mode="HTML")
 
-# ---- File handler ----
+# ---- File handler (also handles leak mode) ----
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     upsert_user(user.id, user.username, user.first_name, user.last_name)
     if is_user_banned(user.id):
         await update.message.reply_text("🚫 You are banned.", parse_mode="HTML")
         return
+
+    # Check if user is in leak mode
+    if context.user_data.get('leak_mode'):
+        context.user_data['leak_mode'] = False  # consume
+        await handle_leak_request(update, context)
+        return
+
     admin = get_admin_by_telegram(user.id)
-    # Log file activity (only for non-admins)
     if not admin:
         if update.message.document:
             msg = f"📄 Document: {update.message.document.file_name}"
@@ -1452,6 +1780,8 @@ application.add_handler(CommandHandler("reply", admin_reply_text))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 application.add_handler(MessageHandler(filters.ALL, handle_forwarded_reply))
+application.add_handler(CallbackQueryHandler(leak_callback, pattern="^leak_"))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^(?!.*/).*'), handle_leak_workflow))  # catch-all for workflow
 application.add_error_handler(error_handler)
 
 # ----------------------------------------------
