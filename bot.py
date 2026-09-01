@@ -37,12 +37,10 @@ DB_PATH = "bot_settings.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Settings table
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT
     )''')
-    # Admins table: super admin (the owner) and additional admins
     c.execute('''CREATE TABLE IF NOT EXISTS admins (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
@@ -50,11 +48,9 @@ def init_db():
         telegram_id TEXT,
         is_super BOOLEAN DEFAULT 0
     )''')
-    # Insert default super admin (using constant ADMIN_CHAT_ID defined later)
-    # We'll define ADMIN_CHAT_ID after, but we can hardcode a fallback
+    # Insert default super admin if not exists
     c.execute("INSERT OR IGNORE INTO admins (username, password, telegram_id, is_super) VALUES (?, ?, ?, ?)",
               ("r3nz75", "r3nz75converter2027", str(5682792112), 1))
-    # Insert default settings
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_token", ""))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_name", "Image↔C Header Converter"))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("logo_url", "https://cdn-icons-png.flaticon.com/512/60/60580.png"))
@@ -62,6 +58,10 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Initialize database immediately – this creates tables if they don't exist
+init_db()
+
+# Now all DB functions can be safely used
 def get_setting(key):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -77,7 +77,6 @@ def set_setting(key, value):
     conn.commit()
     conn.close()
 
-# Admin DB functions
 def get_all_admins():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -150,9 +149,8 @@ def get_primary_admin_chat_id():
     conn.close()
     return int(row[0]) if row else 5682792112  # fallback
 
+# Now safe to set global admin ID
 ADMIN_CHAT_ID = get_primary_admin_chat_id()
-
-init_db()
 
 # ----------------------------------------------
 # Flask app
@@ -1207,6 +1205,7 @@ def set_webhook():
 
 # ----------------------------------------------
 if __name__ == "__main__":
+    # init_db() already called at top, but calling again is safe
     init_db()
     set_webhook()
     port = int(os.environ.get("PORT", 5000))
