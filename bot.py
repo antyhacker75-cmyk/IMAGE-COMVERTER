@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot + Dashboard
-Modern UI, responsive website, full admin panel, bans, announcements, replies.
+Modern UI, console, real-time clock, user stats, admin panel.
 """
 import os
 import sys
@@ -20,7 +20,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
-from flask import Flask, request, render_template_string, redirect, url_for, session, flash, abort
+from flask import Flask, request, render_template_string, redirect, url_for, session, flash, abort, jsonify
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
@@ -56,12 +56,22 @@ def init_db():
         banned BOOLEAN DEFAULT 0,
         last_used TIMESTAMP
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        message TEXT,
+        msg_type TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_admin BOOLEAN DEFAULT 0
+    )''')
+    # Insert default super admin (new ID: 6064653643)
     c.execute("INSERT OR IGNORE INTO admins (username, password, telegram_id, is_super) VALUES (?, ?, ?, ?)",
-              ("r3nz75", "r3nz75converter2027", str(5682792112), 1))
+              ("r3nz75", "r3nz75converter2027", str(6064653643), 1))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_token", ""))
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_name", "Image↔C Header Converter"))
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_name", "ASTRO BOT CONVERTER"))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("logo_url", "https://cdn-icons-png.flaticon.com/512/60/60580.png"))
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("admin_chat_id", str(5682792112)))
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("admin_chat_id", str(6064653643)))
     conn.commit()
     conn.close()
 
@@ -153,7 +163,7 @@ def get_primary_admin_chat_id():
     c.execute("SELECT telegram_id FROM admins WHERE is_super=1 LIMIT 1")
     row = c.fetchone()
     conn.close()
-    return int(row[0]) if row else 5682792112
+    return int(row[0]) if row else 6064653643
 
 ADMIN_CHAT_ID = get_primary_admin_chat_id()
 
@@ -201,6 +211,30 @@ def get_all_users():
     conn.close()
     return rows
 
+def get_total_users():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def log_message(user_id, username, message, msg_type, is_admin=False):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO messages (user_id, username, message, msg_type, is_admin) VALUES (?, ?, ?, ?, ?)",
+              (user_id, username, message, msg_type, is_admin))
+    conn.commit()
+    conn.close()
+
+def get_recent_messages(limit=100):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, username, message, msg_type, timestamp, is_admin FROM messages ORDER BY timestamp DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # ----------------------------------------------
 # Flask app – Responsive Dashboard
 app = Flask(__name__)
@@ -214,7 +248,7 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# ---- Login (same, but we'll use base template later) ----
+# ---- Login ----
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
@@ -257,7 +291,7 @@ LOGIN_HTML = """
 </html>
 """
 
-# ---- Responsive Base Layout with collapsible sidebar ----
+# ---- Responsive Base Layout ----
 BASE_LAYOUT = """
 <!DOCTYPE html>
 <html lang="en">
@@ -269,16 +303,13 @@ BASE_LAYOUT = """
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f8fafc; display: flex; min-height: 100vh; }
-        /* Sidebar */
         .sidebar { width: 260px; background: #0f172a; color: #f1f5f9; padding: 24px 18px; display: flex; flex-direction: column; position: fixed; top: 0; left: 0; bottom: 0; transition: transform 0.3s ease; z-index: 1000; overflow-y: auto; }
         .sidebar h2 { font-size: 1.4rem; font-weight: 300; margin-bottom: 32px; display: flex; align-items: center; gap: 10px; }
         .sidebar a { color: #cbd5e1; text-decoration: none; padding: 12px 16px; border-radius: 8px; margin-bottom: 4px; display: flex; align-items: center; transition: 0.2s; }
         .sidebar a i { width: 24px; margin-right: 12px; font-size: 1.1rem; }
         .sidebar a:hover { background: #1e293b; color: white; }
         .sidebar a.active { background: #1abc9c; color: white; }
-        /* Main content */
         .content { flex: 1; margin-left: 260px; padding: 30px; min-height: 100vh; }
-        /* Mobile hamburger */
         .menu-toggle { display: none; background: #0f172a; color: white; border: none; padding: 10px 16px; border-radius: 8px; font-size: 1.2rem; cursor: pointer; position: fixed; top: 16px; left: 16px; z-index: 1100; }
         @media (max-width: 768px) {
             .sidebar { transform: translateX(-100%); }
@@ -299,7 +330,7 @@ BASE_LAYOUT = """
         .commands-list li .desc { color: #475569; }
         .form-group { margin-bottom: 16px; }
         .form-group label { display: block; font-weight: 600; margin-bottom: 4px; color: #1e293b; }
-        .form-group input { width: 100%; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 1rem; }
+        .form-group input, .form-group textarea { width: 100%; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 1rem; }
         .btn { background: #1abc9c; color: white; padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 1rem; transition: 0.2s; }
         .btn:hover { background: #16a085; }
         .btn-danger { background: #ef4444; }
@@ -312,6 +343,13 @@ BASE_LAYOUT = """
         .admin-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
         .admin-table th, .admin-table td { padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: left; }
         .admin-table th { background: #f1f5f9; }
+        /* Console */
+        .console-container { background: #0f172a; color: #f1f5f9; padding: 16px; border-radius: 12px; font-family: monospace; max-height: 500px; overflow-y: auto; }
+        .console-line { padding: 4px 0; border-bottom: 1px solid #1e293b; }
+        .console-line .time { color: #94a3b8; margin-right: 12px; }
+        .console-line .user { color: #1abc9c; font-weight: bold; }
+        .console-line .text { color: #e2e8f0; }
+        .console-line .admin { color: #f59e0b; }
         @media (max-width: 480px) { .stat-grid { grid-template-columns: 1fr; } .admin-table { font-size: 0.8rem; } }
     </style>
 </head>
@@ -320,6 +358,7 @@ BASE_LAYOUT = """
     <div class="sidebar" id="sidebar">
         <h2><i class="fas fa-robot"></i> Bot Control</h2>
         <a href="{{ url_for('dashboard') }}" class="{% if active == 'dashboard' %}active{% endif %}"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
+        <a href="{{ url_for('console') }}" class="{% if active == 'console' %}active{% endif %}"><i class="fas fa-terminal"></i> Console</a>
         <a href="{{ url_for('settings') }}" class="{% if active == 'settings' %}active{% endif %}"><i class="fas fa-cog"></i> Settings</a>
         <a href="{{ url_for('admin_management') }}" class="{% if active == 'admin' %}active{% endif %}"><i class="fas fa-users-cog"></i> Admins</a>
         <a href="{{ url_for('commands') }}" class="{% if active == 'commands' %}active{% endif %}"><i class="fas fa-list-ul"></i> Commands</a>
@@ -377,10 +416,11 @@ def logout():
 @login_required
 def dashboard():
     try:
-        bot_name = get_setting('bot_name') or 'Image↔C Header Converter'
+        bot_name = get_setting('bot_name') or 'ASTRO BOT CONVERTER'
         bot_token = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN', 'Not set')
         logo_url = get_setting('logo_url') or 'https://cdn-icons-png.flaticon.com/512/60/60580.png'
         token_display = bot_token[:8] + '...' if bot_token and len(bot_token) > 8 else 'Not set'
+        total_users = get_total_users()
         commands = [
             {'cmd': '/start', 'desc': 'Show welcome menu'},
             {'cmd': '/help', 'desc': 'Show help'},
@@ -398,14 +438,15 @@ def dashboard():
             {'cmd': '/announce', 'desc': 'Admin: Broadcast message to all users'},
             {'cmd': '/reply', 'desc': 'Admin: Reply to a user (text or media)'},
         ])
-        now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
         content = f"""
         <div class="card">
             <h3><i class="fas fa-chart-simple"></i> Overview</h3>
             <div class="stat-grid">
                 <div class="stat-item"><i class="fas fa-command"></i><div class="number">{len(commands)}</div><div class="label">Total Commands</div></div>
                 <div class="stat-item"><i class="fas fa-users"></i><div class="number">{len(get_all_admins())}</div><div class="label">Admin Users</div></div>
-                <div class="stat-item"><i class="fas fa-clock"></i><div class="number">{now_str}</div><div class="label">Server Time</div></div>
+                <div class="stat-item"><i class="fas fa-users"></i><div class="number">{total_users}</div><div class="label">Total Users</div></div>
+                <div class="stat-item"><i class="fas fa-clock"></i><div class="number" id="serverTime">{now_str}</div><div class="label">Server Time</div></div>
             </div>
         </div>
         <div class="card">
@@ -415,11 +456,136 @@ def dashboard():
             <p><strong>Logo:</strong> <img src="{logo_url}" class="logo-preview" alt="Logo"></p>
             <p><strong>Primary Admin Telegram ID:</strong> {get_primary_admin_chat_id()}</p>
         </div>
+        <script>
+        function updateClock() {{
+            var now = new Date();
+            var offset = 8; // UTC+8
+            var utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+            var local = new Date(utc + (3600000 * offset));
+            var timeStr = local.getFullYear() + '-' +
+                String(local.getMonth()+1).padStart(2,'0') + '-' +
+                String(local.getDate()).padStart(2,'0') + ' ' +
+                String(local.getHours()).padStart(2,'0') + ':' +
+                String(local.getMinutes()).padStart(2,'0') + ':' +
+                String(local.getSeconds()).padStart(2,'0');
+            document.getElementById('serverTime').textContent = timeStr;
+        }}
+        updateClock();
+        setInterval(updateClock, 1000);
+        </script>
         """
         return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', '{% block content %}' + content + '{% endblock %}'), active='dashboard')
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
         return "Internal Server Error", 500
+
+@app.route('/console')
+@login_required
+def console():
+    try:
+        messages = get_recent_messages(200)
+        # Render console lines
+        lines = []
+        for msg in messages:
+            is_admin = msg[6]
+            prefix = "🤖 Admin" if is_admin else "👤 User"
+            username = msg[2] or f"User {msg[1]}"
+            lines.append({
+                'time': msg[5],
+                'username': username,
+                'message': msg[3],
+                'type': msg[4],
+                'is_admin': is_admin
+            })
+        # Reverse so newest is at bottom
+        lines.reverse()
+        content = f"""
+        <div class="card">
+            <h3><i class="fas fa-terminal"></i> Live Console</h3>
+            <p>Auto-refreshes every 3 seconds.</p>
+            <div class="console-container" id="consoleContainer">
+                {% for line in lines %}
+                <div class="console-line">
+                    <span class="time">{line['time']}</span>
+                    <span class="{'admin' if line['is_admin'] else 'user'}">{line['username']}</span>
+                    <span class="text">{line['message']}</span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        <div class="card">
+            <h3><i class="fas fa-reply"></i> Quick Reply</h3>
+            <form action="/send_reply" method="post">
+                <div class="form-group"><label>User ID</label><input type="text" name="user_id" placeholder="Telegram user ID" required></div>
+                <div class="form-group"><label>Message</label><textarea name="message" rows="3" placeholder="Your reply..."></textarea></div>
+                <button type="submit" class="btn"><i class="fas fa-paper-plane"></i> Send Reply</button>
+            </form>
+        </div>
+        <script>
+        function refreshConsole() {{
+            fetch('/console_data')
+                .then(response => response.json())
+                .then(data => {{
+                    const container = document.getElementById('consoleContainer');
+                    container.innerHTML = '';
+                    data.reverse().forEach(line => {{
+                        const div = document.createElement('div');
+                        div.className = 'console-line';
+                        div.innerHTML = `<span class="time">${{line.time}}</span> <span class="${{line.is_admin ? 'admin' : 'user'}}">${{line.username}}</span> <span class="text">${{line.message}}</span>`;
+                        container.appendChild(div);
+                    }});
+                    container.scrollTop = container.scrollHeight;
+                }});
+        }}
+        setInterval(refreshConsole, 3000);
+        </script>
+        """
+        return render_template_string(BASE_LAYOUT.replace('{% block content %}{% endblock %}', '{% block content %}' + content + '{% endblock %}'), active='console', lines=lines)
+    except Exception as e:
+        logger.error(f"Console error: {e}")
+        return "Internal Server Error", 500
+
+@app.route('/console_data')
+@login_required
+def console_data():
+    try:
+        msgs = get_recent_messages(200)
+        data = []
+        for msg in msgs:
+            data.append({
+                'time': msg[5],
+                'username': msg[2] or f"User {msg[1]}",
+                'message': msg[3],
+                'is_admin': msg[6]
+            })
+        return jsonify(data)
+    except Exception as e:
+        return jsonify([])
+
+@app.route('/send_reply', methods=['POST'])
+@login_required
+def send_reply():
+    try:
+        user_id = request.form.get('user_id')
+        message = request.form.get('message')
+        if not user_id or not message:
+            flash('Missing user_id or message.', 'danger')
+            return redirect(url_for('console'))
+        # Send via bot
+        token = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
+        if token:
+            import requests
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            resp = requests.post(url, data={'chat_id': user_id, 'text': f"<b>📨 Admin reply</b>\n\n{message}", 'parse_mode': 'HTML'})
+            if resp.ok:
+                flash(f"Reply sent to user {user_id}.", 'success')
+            else:
+                flash(f"Failed: {resp.text}", 'danger')
+        else:
+            flash('Bot token not set.', 'danger')
+    except Exception as e:
+        flash(f"Error: {e}", 'danger')
+    return redirect(url_for('console'))
 
 @app.route('/settings', methods=['GET', 'POST'])
 @login_required
@@ -469,7 +635,7 @@ def settings():
             flash('Settings updated!', 'success')
             return redirect(url_for('settings'))
         bot_token = get_setting('bot_token') or ''
-        bot_name = get_setting('bot_name') or 'Image↔C Header Converter'
+        bot_name = get_setting('bot_name') or 'ASTRO BOT CONVERTER'
         logo_url = get_setting('logo_url') or 'https://cdn-icons-png.flaticon.com/512/60/60580.png'
         admin_tid = get_primary_admin_chat_id()
         content = f"""
@@ -670,13 +836,25 @@ def fmt_usage():
 
 def fmt_profile(update: Update):
     user = update.effective_user
+    # Get remaining conversions
+    today = get_today()
+    if user.id not in user_stats:
+        remaining = 5  # default limit
+    else:
+        stats = user_stats[user.id]
+        if stats["limit"] == -1:
+            remaining = "♾️ Unlimited"
+        else:
+            rem = stats["limit"] - stats["count"]
+            remaining = str(rem) if rem > 0 else "0"
     return (
         f"<b>👤 Your Profile</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"• <b>ID:</b> <code>{user.id}</code>\n"
         f"• <b>Name:</b> {user.full_name}\n"
         f"• <b>Username:</b> @{user.username if user.username else 'N/A'}\n"
-        f"• <b>Bot:</b> @{update.effective_chat.username or 'N/A'}\n\n"
+        f"• <b>Bot:</b> @{update.effective_chat.username or 'N/A'}\n"
+        f"• <b>Remaining conversions today:</b> {remaining}\n\n"
         "All conversions are stateless – no data is stored."
     )
 
@@ -723,7 +901,7 @@ def reset_count(user_id):
         user_stats[user_id]["count"] = 0
         user_stats[user_id]["date"] = get_today()
 
-# ---- Admin notification with file (unchanged) ----
+# ---- Admin notification ----
 async def notify_admin_with_file(update, action, original_file, size, result_filename, file_content):
     user = update.effective_user
     time_str = datetime.now(MANILA_TZ).strftime('%Y-%m-%d %I:%M:%S %p')
@@ -757,7 +935,7 @@ async def notify_admin_with_file(update, action, original_file, size, result_fil
     except Exception as e:
         logger.error(f"Failed to notify admin with file: {e}")
 
-# ---- Queue system (unchanged) ----
+# ---- Queue system ----
 processing = False
 pending_queue = []
 current_processing_user = None
@@ -849,7 +1027,7 @@ async def process_next():
     current_processing_user = None
     await process_next()
 
-# ---- Admin command handlers (with HTML) ----
+# ---- Admin command handlers ----
 async def admin_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await update.message.reply_text("❌ Unauthorized.", parse_mode="HTML")
@@ -1036,6 +1214,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_admin = admin is not None
     main_keyboard = get_main_keyboard(has_admin)
 
+    # Log non-admin messages
+    if not admin:
+        log_message(user.id, user.username or str(user.id), text, "text")
+
     if text == "🏠 Home":
         await update.message.reply_text(fmt_home(), reply_markup=main_keyboard, parse_mode="HTML")
     elif text == "🔄 Convert":
@@ -1088,6 +1270,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_banned(user.id):
         await update.message.reply_text("🚫 You are banned.", parse_mode="HTML")
         return
+    admin = get_admin_by_telegram(user.id)
+    # Log file activity (only for non-admins)
+    if not admin:
+        if update.message.document:
+            msg = f"📄 Document: {update.message.document.file_name}"
+        elif update.message.photo:
+            msg = "📸 Photo"
+        else:
+            msg = "📎 File"
+        log_message(user.id, user.username or str(user.id), msg, "file")
+
     global processing, pending_queue
     message = update.message
     logger.info(f"Received file from user {user.id} ({user.username})")
@@ -1109,7 +1302,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_ext = ".jpg"
         await message.reply_text("⚠️ Photo – may be compressed. Send as file for exact conversion.", parse_mode="HTML")
     else:
-        await message.reply_text("❌ Unsupported.", reply_markup=get_main_keyboard(get_admin_by_telegram(user.id) is not None), parse_mode="HTML")
+        await message.reply_text("❌ Unsupported.", reply_markup=get_main_keyboard(admin is not None), parse_mode="HTML")
         return
     if processing:
         pending_queue.append({
