@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot: Image ↔ C Header Converter
-With webhooks – runs on Render Web Service (free) without needing keep‑alive.
+With webhooks – runs on Render Web Service (free).
 Admin Chat ID: 5682792112
 Time zone: Asia/Manila (UTC+8)
 """
@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest   # <-- new import for custom request
 
 # ----------------------------------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -506,36 +507,64 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_menu_keyboard()
         )
 
-# -------------------- MAIN (webhook) --------------------
+# -------------------- MAIN (webhook) with retry & timeout --------------------
 def main():
-    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    # Use a custom request with longer timeouts
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connection_pool_size=8
+    )
+
+    # Build the application
+    app = Application.builder() \
+        .token(TOKEN) \
+        .request(request) \
+        .concurrent_updates(True) \
+        .build()
+
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-
     app.add_handler(CommandHandler("setlimit", admin_set_limit))
     app.add_handler(CommandHandler("resetlimit", admin_reset_limit))
     app.add_handler(CommandHandler("setpremium", admin_set_premium))
     app.add_handler(CommandHandler("stats", admin_stats))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_error_handler(error_handler)
 
-    # Webhook setup – Render provides the public URL via RENDER_EXTERNAL_URL
+    # Webhook setup
     port = int(os.environ.get("PORT", 10000))
     webhook_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not webhook_url:
         print("❌ RENDER_EXTERNAL_URL not set – are you running on Render?")
         sys.exit(1)
-    webhook_url = webhook_url.rstrip('/') + '/' + TOKEN   # unique path
+    webhook_url = webhook_url.rstrip('/') + '/' + TOKEN
 
     print(f"🤖 Starting webhook at: {webhook_url}")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TOKEN,
-        webhook_url=webhook_url
-    )
+
+    # Retry loop if initialization fails due to timeout
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=TOKEN,
+                webhook_url=webhook_url
+            )
+            break  # success
+        except Exception as e:
+            logger.error(f"Webhook startup attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                wait = attempt * 5
+                print(f"Retrying in {wait} seconds...")
+                time.sleep(wait)
+            else:
+                print("All retries failed. Exiting.")
+                sys.exit(1)
 
 if __name__ == "__main__":
     main()
