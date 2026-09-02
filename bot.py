@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot + Dashboard
-Modern UI, console, real-time clock, user stats, admin panel + Leak + Targets + Join Group.
-With file size checks (>50 MB) and robust error handling.
+Modern UI, console, real-time clock, user stats, admin panel + Leak + Targets + Verify Group.
 """
 import os
 import sys
@@ -90,12 +89,13 @@ def init_db():
         created_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    # CHANGE THESE DEFAULT CREDENTIALS BEFORE DEPLOYING!
     c.execute("INSERT OR IGNORE INTO admins (username, password, telegram_id, is_super) VALUES (?, ?, ?, ?)",
-              ("r3nz75", "r3nz75converter2027", str(6064653643), 1))
+              ("admin", "change_this_password", "0", 1))  # Replace with your own
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_token", ""))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("bot_name", "ASTRO BOT CONVERTER"))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("logo_url", "https://cdn-icons-png.flaticon.com/512/60/60580.png"))
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("admin_chat_id", str(6064653643)))
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("admin_chat_id", "0"))
     conn.commit()
     conn.close()
 
@@ -180,14 +180,14 @@ def is_super_admin(username):
 
 def get_primary_admin_chat_id():
     tid = get_setting('admin_chat_id')
-    if tid:
+    if tid and tid != "0":
         return int(tid)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT telegram_id FROM admins WHERE is_super=1 LIMIT 1")
     row = c.fetchone()
     conn.close()
-    return int(row[0]) if row else 6064653643
+    return int(row[0]) if row and row[0] != "0" else 0
 
 ADMIN_CHAT_ID = get_primary_admin_chat_id()
 
@@ -980,7 +980,7 @@ def commands():
         return "Internal Server Error", 500
 
 # ----------------------------------------------
-# Telegram Bot – All features + Targets + Button workflow + Size checks + Join Group (fixed)
+# Telegram Bot – All features
 # ----------------------------------------------
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -1003,7 +1003,7 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup([
     ["📋 Stats", "🚫 Ban User"],
     ["✅ Unban User", "📢 Announcement"],
     ["✉️ Reply to User", "📤 Leak Requests"],
-    ["🎯 Targets", "➕ Join Group"],
+    ["🎯 Targets", "➕ Verify Group"],
     ["⬅️ Back"]
 ], resize_keyboard=True, is_persistent=True)
 
@@ -1755,57 +1755,87 @@ async def handle_leak_custom_id(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="HTML"
     )
 
-# ---- Join Group handler (fixed: uses getChat, no invalid API call) ----
+# ---- VERIFY GROUP (fixed) ----
 async def handle_join_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('join_group'):
         return
-    text = update.message.text.strip()
-    if text.lower() == 'cancel':
+
+    text = (update.message.text or "").strip()
+
+    if text.lower() == "cancel":
         context.user_data.pop('join_group', None)
-        await update.message.reply_text("❌ Join group cancelled.", parse_mode="HTML")
+        await update.message.reply_text(
+            "❌ Verification cancelled.",
+            parse_mode="HTML"
+        )
         return
 
     token = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
+
     if not token:
-        await update.message.reply_text("❌ Bot token not set.", parse_mode="HTML")
         context.user_data.pop('join_group', None)
+        await update.message.reply_text(
+            "❌ Bot token is not configured.",
+            parse_mode="HTML"
+        )
         return
 
-    # Use getChat to check if the bot can access the chat (i.e., it's a member)
-    try:
-        get_chat_url = f"https://api.telegram.org/bot{token}/getChat"
-        resp = req.post(get_chat_url, data={'chat_id': text}, timeout=30)
-        result = resp.json()
-        if result.get('ok'):
-            chat = result['result']
-            chat_title = chat.get('title', 'Unknown')
-            # If we get here, the bot can access the chat, so it's a member.
+    # Only accept numeric IDs (optionally starting with '-')
+    if text.startswith("-") or text.isdigit():
+        try:
+            chat_resp = req.post(
+                f"https://api.telegram.org/bot{token}/getChat",
+                data={"chat_id": text},
+                timeout=30
+            )
+
+            result = chat_resp.json()
+
+            if not result.get("ok"):
+                error_msg = result.get(
+                    "description",
+                    "Unable to access this chat."
+                )
+
+                await update.message.reply_text(
+                    f"❌ Cannot access this chat.\n\n"
+                    f"<b>Telegram:</b> {error_msg}\n\n"
+                    f"Make sure:\n"
+                    f"• The chat ID is correct\n"
+                    f"• The bot has been added to the group/channel\n"
+                    f"• You have permission to add the bot",
+                    parse_mode="HTML"
+                )
+
+                context.user_data.pop('join_group', None)
+                return
+
+            chat = result["result"]
+
             await update.message.reply_text(
-                f"✅ The bot is a member of <b>{chat_title}</b> (ID: <code>{chat['id']}</code>).",
+                f"ℹ️ <b>Chat found</b>\n\n"
+                f"Name: <b>{chat.get('title', 'Unknown')}</b>\n"
+                f"ID: <code>{chat['id']}</code>\n"
+                f"Type: <code>{chat.get('type', 'unknown')}</code>\n\n"
+                f"⚠️ A bot cannot join a chat using its chat ID.\n"
+                f"Please add this bot to the group/channel manually.",
                 parse_mode="HTML"
             )
-        else:
-            error_msg = result.get('description', 'Unknown error')
-            # Check for specific errors
-            if "not found" in error_msg.lower():
-                await update.message.reply_text(
-                    "❌ Chat not found. Make sure the ID is correct and the bot is already a member.\n\n"
-                    "🔹 <b>How to add the bot:</b>\n"
-                    "1. Add the bot to your group/channel manually (as an admin if needed).\n"
-                    "2. Then send the chat ID here to verify.",
-                    parse_mode="HTML"
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ Cannot access the chat: {error_msg}\n\n"
-                    "🔹 <b>How to fix:</b>\n"
-                    "1. Make sure the bot is a member of the chat.\n"
-                    "2. The chat ID must be correct (negative for supergroups).\n"
-                    "3. The bot needs permission to send messages in the chat.",
-                    parse_mode="HTML"
-                )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}", parse_mode="HTML")
+
+        except Exception as e:
+            logger.exception("Chat verification failed")
+
+            await update.message.reply_text(
+                f"❌ Error checking chat:\n<code>{e}</code>",
+                parse_mode="HTML"
+            )
+    else:
+        await update.message.reply_text(
+            "⚠️ Invite links cannot be used.\n\n"
+            "Please add the bot to the group/channel manually, "
+            "then send the numeric chat ID here to verify it.",
+            parse_mode="HTML"
+        )
 
     context.user_data.pop('join_group', None)
 
@@ -1875,7 +1905,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_targets_menu(update, context)
         else:
             await update.message.reply_text("❌ You are not an admin.", reply_markup=main_keyboard, parse_mode="HTML")
-    elif text == "➕ Join Group":
+    elif text == "➕ Verify Group":
         if admin:
             context.user_data['join_group'] = True
             await update.message.reply_text(
@@ -1890,7 +1920,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ You are not an admin.", reply_markup=main_keyboard, parse_mode="HTML")
     else:
-        # Admin command buttons
+        # Existing admin buttons
         if text == "📊 Set Limit":
             await update.message.reply_text("📝 Send: <code>/setlimit &lt;user_id&gt; &lt;limit&gt;</code>\n(use -1 for unlimited)", parse_mode="HTML")
         elif text == "🔄 Reset Limit":
@@ -2096,52 +2126,48 @@ def recover_image_from_header(content: str) -> tuple[bytes, str]:
     return bytes(data), original_name
 
 # ----------------------------------------------
-# Build the bot application
+# Build the bot application (only if token exists)
 BOT_TOKEN = get_setting('bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
-if not BOT_TOKEN:
-    print("⚠️ No bot token set. Set it in the dashboard or via env.")
 
-request_obj = HTTPXRequest(
-    connect_timeout=30.0,
-    read_timeout=120.0,
-    write_timeout=30.0,
-    connection_pool_size=8
-)
-application = Application.builder().token(BOT_TOKEN).request(request_obj).concurrent_updates(True).build()
-
-# Command handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("setlimit", admin_set_limit))
-application.add_handler(CommandHandler("resetlimit", admin_reset_limit))
-application.add_handler(CommandHandler("setpremium", admin_set_premium))
-application.add_handler(CommandHandler("setlimitall", admin_set_limit_all))
-application.add_handler(CommandHandler("stats", admin_stats))
-application.add_handler(CommandHandler("ban", admin_ban))
-application.add_handler(CommandHandler("unban", admin_unban))
-application.add_handler(CommandHandler("announce", admin_announce))
-application.add_handler(CommandHandler("reply", admin_reply_text))
-
-# Message handlers with priorities
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_join_group), group=1)
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu), group=2)
-
-# File handlers
-application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
-application.add_handler(MessageHandler(filters.ALL, handle_forwarded_reply))
-
-# Callback query handlers
-application.add_handler(CallbackQueryHandler(leak_callback, pattern="^leak_"))
-application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^-?\\d+$'), handle_leak_custom_id))
-
-application.add_error_handler(error_handler)
-
-# ----------------------------------------------
-# Persistent event loop
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
+application = None
+loop = None
 if BOT_TOKEN:
+    request_obj = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=120.0,
+        write_timeout=30.0,
+        connection_pool_size=8
+    )
+    application = Application.builder().token(BOT_TOKEN).request(request_obj).concurrent_updates(True).build()
+
+    # Add all handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("setlimit", admin_set_limit))
+    application.add_handler(CommandHandler("resetlimit", admin_reset_limit))
+    application.add_handler(CommandHandler("setpremium", admin_set_premium))
+    application.add_handler(CommandHandler("setlimitall", admin_set_limit_all))
+    application.add_handler(CommandHandler("stats", admin_stats))
+    application.add_handler(CommandHandler("ban", admin_ban))
+    application.add_handler(CommandHandler("unban", admin_unban))
+    application.add_handler(CommandHandler("announce", admin_announce))
+    application.add_handler(CommandHandler("reply", admin_reply_text))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_join_group), group=1)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu), group=2)
+
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    application.add_handler(MessageHandler(filters.ALL, handle_forwarded_reply))
+
+    application.add_handler(CallbackQueryHandler(leak_callback, pattern="^leak_"))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^-?\\d+$'), handle_leak_custom_id))
+
+    application.add_error_handler(error_handler)
+
+    # Persistent event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     try:
         loop.run_until_complete(application.initialize())
         loop.run_until_complete(application.start())
@@ -2149,18 +2175,22 @@ if BOT_TOKEN:
     except Exception as e:
         logger.error(f"❌ Failed to initialize application: {e}")
 
-def run_loop():
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
 
-thread = threading.Thread(target=run_loop, daemon=True)
-thread.start()
-logger.info("✅ Event loop running in background thread.")
+    thread = threading.Thread(target=run_loop, daemon=True)
+    thread.start()
+    logger.info("✅ Event loop running in background thread.")
+else:
+    logger.warning("⚠️ No BOT_TOKEN set. Bot will not start until token is provided via dashboard or env.")
 
 # ----------------------------------------------
 # Webhook endpoint
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    if not application:
+        return "Bot not initialized", 503
     if request.method == 'POST':
         json_data = request.get_json()
         if not json_data:
