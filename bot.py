@@ -980,7 +980,7 @@ def commands():
         return "Internal Server Error", 500
 
 # ----------------------------------------------
-# Telegram Bot – All features + Targets + Button workflow + Size checks + Join Group
+# Telegram Bot – All features + Targets + Button workflow + Size checks + Join Group (fixed)
 # ----------------------------------------------
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -1755,7 +1755,7 @@ async def handle_leak_custom_id(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="HTML"
     )
 
-# ---- Improved Join Group handler ----
+# ---- Join Group handler (fixed: uses getChat, no invalid API call) ----
 async def handle_join_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('join_group'):
         return
@@ -1771,90 +1771,39 @@ async def handle_join_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('join_group', None)
         return
 
-    # Try to get chat info first to verify the ID/link is valid
-    chat_id = None
-    is_invite_link = text.startswith('https://t.me/') or text.startswith('t.me/')
-    
-    if not is_invite_link:
-        # It's a chat ID – verify it exists
-        try:
-            get_chat_url = f"https://api.telegram.org/bot{token}/getChat"
-            get_resp = req.post(get_chat_url, data={'chat_id': text}, timeout=30)
-            get_result = get_resp.json()
-            if get_result.get('ok'):
-                chat = get_result['result']
-                chat_id = chat['id']
-                chat_title = chat.get('title', 'Unknown')
-                # Check if bot is already a member
-                if chat.get('is_member') is not None:
-                    if chat.get('is_member'):
-                        await update.message.reply_text(
-                            f"ℹ️ The bot is already a member of <b>{chat_title}</b>.",
-                            parse_mode="HTML"
-                        )
-                        context.user_data.pop('join_group', None)
-                        return
-            else:
-                error_msg = get_result.get('description', 'Unknown error')
-                await update.message.reply_text(
-                    f"❌ Could not find the chat. Error: {error_msg}\n\n"
-                    "Make sure you are using the correct chat ID (e.g., <code>-1001234567890</code> for supergroups).",
-                    parse_mode="HTML"
-                )
-                context.user_data.pop('join_group', None)
-                return
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error verifying chat: {str(e)}", parse_mode="HTML")
-            context.user_data.pop('join_group', None)
-            return
-
-    # Now try to join
-    url = f"https://api.telegram.org/bot{token}/joinChat"
-    data = {}
-    if is_invite_link:
-        data['invite_link'] = text
-    else:
-        data['chat_id'] = text
-
+    # Use getChat to check if the bot can access the chat (i.e., it's a member)
     try:
-        resp = req.post(url, data=data, timeout=30)
+        get_chat_url = f"https://api.telegram.org/bot{token}/getChat"
+        resp = req.post(get_chat_url, data={'chat_id': text}, timeout=30)
         result = resp.json()
         if result.get('ok'):
-            # Successfully joined – get chat info
-            if chat_id:
-                get_chat_url = f"https://api.telegram.org/bot{token}/getChat"
-                chat_resp = req.post(get_chat_url, data={'chat_id': chat_id}, timeout=30)
-                chat_result = chat_resp.json()
-                if chat_result.get('ok'):
-                    chat = chat_result['result']
-                    await update.message.reply_text(
-                        f"✅ Successfully joined <b>{chat.get('title', 'Unknown')}</b> (ID: <code>{chat['id']}</code>).",
-                        parse_mode="HTML"
-                    )
-                else:
-                    await update.message.reply_text("✅ Successfully joined the chat.", parse_mode="HTML")
-            else:
-                await update.message.reply_text("✅ Successfully joined the chat.", parse_mode="HTML")
+            chat = result['result']
+            chat_title = chat.get('title', 'Unknown')
+            # If we get here, the bot can access the chat, so it's a member.
+            await update.message.reply_text(
+                f"✅ The bot is a member of <b>{chat_title}</b> (ID: <code>{chat['id']}</code>).",
+                parse_mode="HTML"
+            )
         else:
             error_msg = result.get('description', 'Unknown error')
-            if "already a member" in error_msg.lower():
-                await update.message.reply_text("ℹ️ The bot is already a member of this chat.", parse_mode="HTML")
-            elif "invite link" in error_msg.lower() and "expired" in error_msg.lower():
-                await update.message.reply_text("❌ The invite link has expired. Please generate a new one.", parse_mode="HTML")
-            elif "user not found" in error_msg.lower():
+            # Check for specific errors
+            if "not found" in error_msg.lower():
                 await update.message.reply_text(
-                    "❌ User not found. Make sure you are using the correct chat ID.\n"
-                    "For supergroups, use a negative ID like <code>-1001234567890</code>.",
-                    parse_mode="HTML"
-                )
-            elif "need to be invited" in error_msg.lower() or "need to join" in error_msg.lower():
-                await update.message.reply_text(
-                    "❌ The bot needs to be invited to this chat first.\n"
-                    "Please add the bot to the chat manually, or use an invite link.",
+                    "❌ Chat not found. Make sure the ID is correct and the bot is already a member.\n\n"
+                    "🔹 <b>How to add the bot:</b>\n"
+                    "1. Add the bot to your group/channel manually (as an admin if needed).\n"
+                    "2. Then send the chat ID here to verify.",
                     parse_mode="HTML"
                 )
             else:
-                await update.message.reply_text(f"❌ Failed to join: {error_msg}", parse_mode="HTML")
+                await update.message.reply_text(
+                    f"❌ Cannot access the chat: {error_msg}\n\n"
+                    "🔹 <b>How to fix:</b>\n"
+                    "1. Make sure the bot is a member of the chat.\n"
+                    "2. The chat ID must be correct (negative for supergroups).\n"
+                    "3. The bot needs permission to send messages in the chat.",
+                    parse_mode="HTML"
+                )
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}", parse_mode="HTML")
 
@@ -1930,8 +1879,11 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if admin:
             context.user_data['join_group'] = True
             await update.message.reply_text(
-                "📝 Send the group ID (e.g., <code>-1001234567890</code>) or an invite link.\n"
-                "The bot will try to join that group/channel.\n"
+                "📝 Send the group/channel ID, for example:\n"
+                "<code>-1001234567890</code>\n\n"
+                "⚠️ The bot cannot join a chat automatically using its ID.\n"
+                "First add the bot to the group/channel manually, "
+                "then send the ID here to verify that the bot can access it.\n\n"
                 "Type <code>cancel</code> to abort.",
                 parse_mode="HTML"
             )
